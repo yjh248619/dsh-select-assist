@@ -1,0 +1,80 @@
+{
+	"name": "dsh-select-assist",
+	"displayName": "划词助手",
+	"version": "0.9.7",
+	"description": "DSH plugin: select text in any Windows app to explain, summarize, or translate it with DeepSeek Harness — answered in a native always-on-top overlay (draggable, resizable). · DeepSeek Harness 划词工具：任意应用里选中文字即在锚点右下角弹出菜单，用 Harness 解释/总结/翻译（自动带上选区所在的上下文段落），流式落在零依赖的原生置顶浮窗里（可拖动/缩放）。0.9.5：本机接口加 Origin/JSON 校验、流空闲超时、配额错误直接换模型、双客户端只投一次。0.9.6：朗读相关代码与图标彻底删除，解释/总结/翻译换新图标。0.9.7：兜底模型默认留空，由用户自己配置，不再内置任何服务商默认值。",
+	"type": "module",
+	"main": "lib/index.js",
+	"exports": {
+		".": "./lib/index.js",
+		"./client": "./lib/client.js",
+		"./cordis.patch.yml": "./cordis.patch.yml",
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"lib",
+		"companion",
+		"cordis.patch.yml",
+		"README.md"
+	],
+	"dsh": {
+		"bundle": {
+			"patch": "./cordis.patch.yml"
+		},
+		"client": {
+			"platform": "web"
+		}
+	},
+	"scripts": {
+		"build": "tsdown",
+		"dev": "tsdown --watch",
+		"typecheck": "tsc --noEmit",
+		"test": "node --experimental-strip-types --test test/gesture.test.mjs test/panel-zone.test.mjs test/policy.test.mjs test/selection.test.mjs test/companion-manager.test.mjs",
+		"verify:screenshots": "node scripts/verify-screenshots.mjs"
+	},
+	"keywords": [
+		"dsh",
+		"dsh-plugin",
+		"dsh-bundle",
+		"deepseek-harness",
+		"translate",
+		"explain",
+		"summarize",
+		"selection",
+		"text-selection",
+		"overlay",
+		"windows",
+		"划词",
+		"翻译",
+		"解释",
+		"总结"
+	],
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/yjh248619/dsh-select-assist.git"
+	},
+	"homepage": "https://github.com/yjh248619/dsh-select-assist#readme",
+	"bugs": {
+		"url": "https://github.com/yjh248619/dsh-select-assist/issues"
+	},
+	"devDependencies": {
+		"@types/node": "^24.13.3",
+		"@types/react": "~18.3.1",
+		"@types/react-dom": "~18.3.7",
+		"react": "^18.3.1",
+		"react-dom": "^18.3.1",
+		"tsdown": "^0.23.0",
+		"typescript": "^5.6.0"
+	},
+	"author": "yjh248619",
+	"contributors": [
+		{
+			"name": "germyGao",
+			"url": "https://github.com/germyGao/dsh-select-assist"
+		}
+	],
+	"publishConfig": {
+		"access": "public"
+	}
+}
