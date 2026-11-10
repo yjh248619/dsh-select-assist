@@ -107,7 +107,7 @@ Select text in any Windows app — the Harness model explains, summarizes, or tr
 
 本仓库根目录就是一个 **bundle 插件包**（`package.json#dsh.bundle` → `cordis.patch.yml`），且**构建产物已入库**（`lib/`）——git 源安装不需要任何构建步骤。
 
-已发布到 npm：**`dsh-select-assist@0.9.7`**（https://www.npmjs.com/package/dsh-select-assist）。
+已发布到 npm：**`dsh-select-assist@0.9.8`**（https://www.npmjs.com/package/dsh-select-assist）。
 
 ```sh
 # npm（已发布，最省事）
