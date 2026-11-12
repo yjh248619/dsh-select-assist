@@ -1,7 +1,7 @@
 {
-  "name": "dsh-select-assist",
-  "displayName": "划词助手",
-  "version": "0.9.8",
+  "name": "dsh-select-assist-plus",
+  "displayName": "划词助手 Plus",
+  "version": "0.9.13",
   "description": "DSH plugin: select text in any Windows app to explain, summarize, or translate it with DeepSeek Harness — answered in a native always-on-top overlay (draggable, resizable). · DeepSeek Harness 划词工具：任意应用里选中文字即在锚点右下角弹出菜单，用 Harness 解释/总结/翻译（自动带上选区所在的上下文段落），流式落在零依赖的原生置顶浮窗里（可拖动/缩放）。0.9.5：本机接口加 Origin/JSON 校验、流空闲超时、配额错误直接换模型、双客户端只投一次。0.9.6：朗读相关代码与图标彻底删除，解释/总结/翻译换新图标。0.9.7：兜底模型默认留空，由用户自己配置，不再内置任何服务商默认值。 0.9.8：翻译优先走 Bing/Google 机译（匿名端点，失败自动回落到模型座位）。",
   "type": "module",
   "main": "lib/index.js",
@@ -52,11 +52,14 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yjh248619/dsh-select-assist.git"
+    "url": "git+https://github.com/yjh248619/dsh-select-assist-plus.git"
   },
-  "homepage": "https://github.com/yjh248619/dsh-select-assist#readme",
+  "homepage": "https://github.com/yjh248619/dsh-select-assist-plus#readme",
   "bugs": {
-    "url": "https://github.com/yjh248619/dsh-select-assist/issues"
+    "url": "https://github.com/yjh248619/dsh-select-assist-plus/issues"
+  },
+  "dependencies": {
+    "mathjax-full": "^3.2.1"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

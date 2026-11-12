@@ -23,8 +23,21 @@
 export const GESTURE_DEFAULTS = {
   /** 拖选判定：按下到松开之间的最大位移（像素）。 */
   dragMinDistance: 5,
-  /** 双击判定：两次点击的最大间隔（毫秒）。 */
-  doubleClickMs: 420,
+  /**
+   * 双击判定：两次点击的最大间隔（毫秒）。
+   *
+   * 为什么是 550 而不是 420：这个检测器不"判定"双击，它只是**复述系统已经做出的判定**。
+   * Windows 默认 500ms（GetDoubleClickTime）以内、同一位置的两下点击，文本应用**已经把词
+   * 选出来了**——我们用 420 就会漏掉 420–500ms 这一档：系统选好了词，插件却连一个手势都
+   * 没发出（`/status` 里连一条 decision 都看不到），菜单当然不弹。手抖、触控板双击、远程
+   * 桌面/虚拟机的输入延迟，都正好把间隔推到这一档，用户看到的就是"双击有概率没反应"。
+   *
+   * 为什么不更大：再放宽就会把"两次独立的单击"吞成双击——同一位置连点两下的语义本来就是
+   * 双击，但 700ms 以上更像"点一下、过会儿再点一下"。550 只比系统默认多 50ms，留给采样
+   * 抖动（扫描间隔 15ms 量级），不改变语义；`doubleClickSlop` 保持 6px（系统默认双击矩形
+   * 是 4px 见方，这里已经松了一档），位置差得多的两下不会被拼成双击。
+   */
+  doubleClickMs: 550,
   /** 双击判定：两次点击的最大位移（像素）。 */
   doubleClickSlop: 6,
 }
@@ -76,8 +89,12 @@ export function createGestureDetector(options = {}) {
     // downX/downY 也要带上：调用方用"按下点"判断**这次手势是不是选出了那段文字**
     // （旧选区还留在应用里时，光凭鼠标松开的位置分不出"这次真选了"还是"上次留下的"）。
     const at = { x, y, time, downX, downY }
+    // 拖选结束要把"点击计数"清零（见下面 lastUpTime 的赋值）：Windows 在位移超过拖拽阈值
+    // 时就不再把这一串当成点击，拖完立刻点一下也不会被系统认成双击。
+    let countsAsClick = true
     if (distance >= config.dragMinDistance) {
       awaitingSecondClick = false
+      countsAsClick = false
       onGesture({ kind: 'drag', distance, ...at })
     } else if (awaitingSecondClick) {
       awaitingSecondClick = false
@@ -85,7 +102,9 @@ export function createGestureDetector(options = {}) {
     }
     lastUpX = x
     lastUpY = y
-    lastUpTime = time
+    // 拖选之后清掉时间戳（而不是写成这次的 time）：否则"拖完 550ms 内在同一位置点一下"
+    // 会被下采样拼成一次 double——用户只是点了一下光标，菜单却弹出来，且锚在错误的词上。
+    lastUpTime = countsAsClick ? time : Number.NEGATIVE_INFINITY
   }
 
   return { push }

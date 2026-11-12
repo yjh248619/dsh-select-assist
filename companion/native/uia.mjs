@@ -521,18 +521,29 @@ export function createUiaReader(koffi) {
         if (pattern === null) continue
         cleanup.push(pattern)
         const selection = rangesFor(pattern)
-        const current = selection !== null && selection.ranges.length > 0 ? selection.ranges[0] : null
-        if (current === null) {
+        const ranges = selection === null ? [] : selection.ranges
+        if (ranges.length === 0) {
           if (empty === null) empty = blank(iface, source)
           continue
         }
-        cleanup.push(current)
-        const selected = rangeText(current)
-        const rects = rangeRects(current)
+        // 一个选区可能被应用拆成多个 range（Chrome/PDF 跨行、跨块的选择就是这样）。
+        // 只读 ranges[0] 会得到"半截原文"——实测：拖选一整段公式，只拿到后半截 39 字，
+        // 面板里的「原文」和用户选中的对不上。把所有 range 的文本按行拼起来才是完整选区。
+        const selectedParts = []
+        const rects = []
+        for (const range of ranges) {
+          cleanup.push(range)
+          const part = rangeText(range)
+          if (part !== '') selectedParts.push(part)
+          const list = rangeRects(range)
+          if (list !== null) rects.push(...list)
+        }
+        const selected = selectedParts.join('\n')
         if (selected.trim() === '') {
           if (empty === null) empty = blank(iface, source)
           continue
         }
+        const current = ranges[0]
         // 第一处真选区就收工：候选是按"最具体 → 最外层"排的，再往下只会更粗。
         const found = contextFrom(iface, current, selected, cleanup)
         return {
@@ -541,9 +552,9 @@ export function createUiaReader(koffi) {
           text: found === null ? '' : found.text,
           className: found === null ? String(property(iface, UIA_ClassNamePropertyId) || '') : found.className,
           /** 这段选区的屏幕矩形（最前面的几个）：诊断用，/probe 会带出来。 */
-          rects: rects === null ? null : rects.slice(0, 6),
+          rects: rects.length === 0 ? null : rects.slice(0, 6),
           /** 这次手势（按下点/松开点）碰到这段选区了吗（true / false / null=拿不到矩形）。 */
-          atGesture: gestureTouchesSelection(rects, [options.press ?? point, point]),
+          atGesture: gestureTouchesSelection(rects.length === 0 ? null : rects, [options.press ?? point, point]),
           source,
           candidates: seen,
         }

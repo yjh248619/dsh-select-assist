@@ -271,6 +271,48 @@ export function createGdi(koffi) {
         gdip.FillPath(graphics, brush(color), path)
         gdip.DeletePath(path)
       },
+      /**
+       * 一次填充多条闭合子路径（LaTeX 公式的字形轮廓）。
+       *
+       * 三个要点：
+       * 1) FillModeWinding(1) —— 字形的孔洞（a/e/o 中间那块）靠轮廓绕向相反来挖空，
+       *    Alternate(0, 现有 fillPolygon 用的) 会把方向相同的嵌套轮廓互相抵消成一片空。
+       * 2) **一次** FillPath 画完整条公式的所有子路径，不能每条 FillPath：逐条填充
+       *    等于每个轮廓各算一次"内部"，孔洞会被后画的实心轮廓糊死。
+       * 3) 每个子路径自己 ClosePathFigure —— 闭合后 AddPathLine 会自动开新 figure。
+       * @param subpaths - [{ points: [[x,y], ...], ... }, ...]
+       * @param color - ARGB uint32（与 fillPolygon 相同）
+       */
+      fillSubpaths(subpaths, color) {
+        if (!Array.isArray(subpaths) || subpaths.length === 0) return
+        const out = [null]
+        if (gdip.CreatePath(1 /* FillModeWinding */, out) !== 0) return
+        const path = out[0]
+        // koffi 的 `void *` 是外部指针（BigInt 语义），只能和 null 比，不能用 typeof 判断
+        if (path === null) return
+        try {
+          let figures = 0
+          for (const subpath of subpaths) {
+            const points = subpath === null || subpath === undefined ? null : subpath.points
+            if (!Array.isArray(points) || points.length < 2) continue
+            const first = points[0]
+            const second = points[1]
+            if (!Array.isArray(first) || !Array.isArray(second)) continue
+            gdip.AddPathLine(path, first[0], first[1], second[0], second[1])
+            for (let i = 1; i < points.length - 1; i++) {
+              const from = points[i]
+              const to = points[i + 1]
+              gdip.AddPathLine(path, from[0], from[1], to[0], to[1])
+            }
+            gdip.ClosePathFigure(path)
+            figures += 1
+          }
+          if (figures === 0) return
+          gdip.FillPath(graphics, brush(color), path)
+        } finally {
+          gdip.DeletePath(path)
+        }
+      },
       strokeEllipse(x, y, w, h, color, width = 1) {
         const path = (() => {
           const out = [null]

@@ -1,13 +1,13 @@
-<h1 align="center">划词助手</h1>
+<h1 align="center">划词助手 Plus</h1>
 
-<p align="center"><sub>SelectAssist · 包名 <code>dsh-select-assist</code> · for DeepSeek Harness</sub></p>
+<p align="center"><sub>SelectAssist · 包名 <code>dsh-select-assist-plus</code> · for DeepSeek Harness</sub></p>
 
 <p align="center">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-4d6bfe?style=flat-square">
   <img alt="dsh" src="https://img.shields.io/badge/dsh-bundle%20plugin-4d6bfe?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows-4d6bfe?style=flat-square">
   <img alt="deps" src="https://img.shields.io/badge/runtime%20deps-none-4d6bfe?style=flat-square">
-  <a href="https://www.npmjs.com/package/dsh-select-assist"><img alt="npm" src="https://img.shields.io/npm/v/dsh-select-assist?style=flat-square&color=4d6bfe"></a>
+  <img alt="local build" src="https://img.shields.io/badge/build-0.9.13-4d6bfe?style=flat-square">
 </p>
 
 <p align="center">划词即问：在电脑上任意应用里选中文字，用 DeepSeek Harness 自己的模型解释、总结或翻译，或者直接引用进会话里问问，结果落在可拖动、可缩放的置顶浮窗里。<br>
@@ -32,9 +32,9 @@ Select text in any Windows app — the Harness model explains, summarizes, or tr
 - **系统级划词**（主路径）：在**任何 Windows 应用**里拖选或双击选词 → 以选区右下角为锚点、第四象限弹出菜单（`解释` / `总结` / `翻译` / `问问` 四段）→ 前三个弹出置顶悬浮窗流式作答，「问问」把原文引用进 DSH 会话。
 - **划词尽量不碰剪贴板**：菜单在手势落下的那一刻就弹（不再"先注入 Ctrl+C 取词、取到才弹"——那条路上取词失败就等于菜单呼不出来）；选中的文字留到**点菜单项时**才解析，先走 UI Automation 直接读选区，只有它读不到才注入一次 Ctrl+C 读剪贴板兜底。会在**弹菜单之前**碰剪贴板的情形有两类：应用对 UIA 完全说不出话（WPS 的 Qt 版这类），以及 UIA 只报出一个**空选区**——普通元素带 TextPattern 却报不出选区时不能就此下结论（WPS 的探针常常只命中功能区那样的无关文本控件，那里本来就没有选区），这两档都只能注入一次 Ctrl+C 来核实"这次手势到底有没有选中文字"（见下文），`DSH_SELECTION_CONFIRM=0` 可关掉。
 - **一份选区只弹一次菜单**：菜单以任何方式收起（超时、Esc、点到别处、点了菜单项）之后，那份**旧选区还留在应用里也不会让菜单再冒出来**——只有重新划词（选出了新的一段）才会再弹。少了这条，"选中一次"之后就变成"到哪里拖菜单都会出来"。
-- **菜单与回答窗口彼此独立**：划词菜单有显示时限（默认 **3.6 秒**），超时、按 Esc、或用**任意鼠标键**点到别处都会收起；回答窗口**只有手动关闭（标题栏 ✕）才会消失**——新划词不会动它，**窗口里的内容也只在点菜单项（解释/总结/翻译）时才会换**（再选一段文字、点窗口、滚轮都不会把结果顶掉）。
+- **菜单与回答窗口彼此独立、且可多窗并存**：划词菜单有显示时限（默认 **3.6 秒**），超时、按 Esc、或用**任意鼠标键**点到别处都会收起；回答窗口**只有手动关闭（标题栏 ✕）才会消失**——新划词不会动它。0.9.9 起每段划词各自开一扇回答窗：再选一段文字点别的动作，上一扇**原样保留**、互不覆盖（最多 4 扇，超了关最旧的那扇）。
+- **标题栏四个按钮**（从右往左：关闭 / 复制 / 折叠 / 最小化到任务栏）：**复制**把回答写进剪贴板，页脚回执「已复制 / 复制失败」；没有内容可复制时按钮画成灰的；**折叠**（上/下箭头）把窗口收成一条标题带留在原地、不消失，再点一下展开；**最小化**（—）把窗口缩进 Windows 任务栏（任务栏按钮名「DSH 划词助手 · 解释」），点它就能回来。
 - **总结**：选中长段文字点「总结」，先用一句话给出核心结论，再分「要点」逐条列出关键信息；原文有明确结构（章节、列表、对话轮次）时保留大致层次再压缩。总结规则同样可在设置页改。
-- **标题栏两个按钮**（从右往左：关闭 / 复制）：**复制**把回答写进剪贴板，页脚回执「已复制 / 复制失败」；没有内容可复制时按钮画成灰的，让"点了没反应"变成"看得出点不了"。
 - **翻译会分情况给结果**（由翻译规则驱动，可改）：选中的是**词/短语**时按词典条目输出——**最佳翻译**、**音标**（英/美）、**其他翻译**（带词性与使用场景）、关键术语或缩写再给**术语说明**；选中的是**句子/段落**时先给整段译文，若句中出现关键术语、缩写或专有名词，再追加**关键术语**小节逐条解释。
 - **自动带上上下文**（像知乎的划词解释）：手势落下后立刻用 UI Automation 读"选区 + 选区所在的那个段落"（一次读完），点解释/总结/翻译时连同上文一起交给模型，回答落在语境里而不是孤立地解释一个词；读不到（应用不暴露 UIA 文本）就安静降级为只送选区，再读不到才退到剪贴板。
 - **页内划词**（保底路径）：同一套菜单/悬浮窗也注册在 DSH 的 `shell.overlay` 槽位里；系统级能力不可用时（没装 koffi、被显式关闭）自动接管，DSH 页面内划词照常可用。页内这条路同样"一份选区只弹一次"（用选区的起点/终点位置 + 文本当签名，`selectionchange` 一变就作废）。
@@ -42,8 +42,8 @@ Select text in any Windows app — the Harness model explains, summarizes, or tr
 - **两种回答引擎**（设置页 `engine` 切换）：
   - `direct`（默认，快）：插件直接用宿主的 `llm` 服务流式调一次模型，**不建 DSH 会话**。首字延迟约 1.2–1.3 秒、整段完成 1.5–4.5 秒，且是真流式（首字到达即渲染，实测一段 490 delta 均匀分布在 1.3–4.4 秒）。代价：没有系统提示、没有工具、划词记录不进侧栏，不能点进去追问。
   - `agent`（慢但可追问）：用 `ctx.agents` 跑一轮**真实会话回合**（同一套 agent loop、系统提示、工具、模型 route），每次划词都是一条全新会话，**跑完不归档**，会话出现在侧栏「未分组」里，可以点进去追问。代价是首字要等整轮跑完（4.3–5.5 秒）。
-- **回答渲染**：系统级浮层用 GDI+ 自绘 markdown-lite（标题、列表、代码、引用、表格），页内用官方 Markdown 原语渲染。
-- **零外部依赖、零额外进程**：系统级浮层是**伴生进程自己创建的原生 Win32 分层窗口 + GDI+ 自绘**——不需要 Edge/Chrome，不启动任何浏览器，不装任何运行时。颜色、圆角、图标都照 DSH 主题令牌取值。
+- **回答渲染**：系统级浮层用 GDI+ 自绘 markdown-lite（标题、列表、代码、引用、表格），**行内公式 `$...$` 与独立公式 `$$...$$` 会用 MathJax 排版成真正的数学字形**（分式、根号、上下标、矩阵都对），页内用官方 Markdown 原语渲染。
+- **零额外进程、零浏览器**：系统级浮层是**伴生进程自己创建的原生 Win32 分层窗口 + GDI+ 自绘**——不需要 Edge/Chrome，不启动任何浏览器。颜色、圆角、图标都照 DSH 主题令牌取值。唯一的运行依赖是 `mathjax-full`（把 LaTeX 转成矢量路径，懒加载，首次约 0.4 秒，之后每条毫秒级并缓存）。
 
 ## 界面
 
@@ -84,7 +84,7 @@ Select text in any Windows app — the Harness model explains, summarizes, or tr
 
 - **为什么要有伴生进程**：DSH 插件跑在 dsh 进程里，拿不到全局鼠标、也起不了置顶窗口。伴生进程用 dsh **自带**的 koffi（FFI）直接调 user32/gdi32/gdiplus，不需要额外编译或安装任何东西。
 - **为什么是原生窗口而不是浏览器窗口**：不依赖 Edge/Chrome（没有浏览器的机器也能用）、不额外起进程、不占几百 MB 内存；拖动/缩放由 Windows 原生处理（`WM_NCHITTEST`），圆角与阴影是分层窗口的逐像素透明，比浏览器窗口更贴合 DSH 的观感。
-- **两个窗口，不是一个**：划词菜单与回答窗口是两个独立原生窗口（菜单 328×36 横向四段；回答窗口 380×460，按显示器缩放换算成物理像素）。菜单超时/被点掉都不会影响回答窗口；回答窗口没有悬浮球、也没有最小化，唯一的手动关闭入口是标题栏的 ✕。
+- **两个窗口，不是一个**：划词菜单与回答窗口是两个独立原生窗口（菜单 328×36 横向四段；回答窗口 380×460，按显示器缩放换算成物理像素）。菜单超时/被点掉都不会影响回答窗口；回答窗口可以折叠成标题带、也可以最小化到任务栏，关闭入口是标题栏的 ✕。
 - **上下文为什么要用 UI Automation**：要在 Windows 上通用地拿到"选区周围那段话"，又不改动用户选区、不注入额外按键、不额外起常驻进程，只有 UIA 的 TextPattern 做得到（取选区范围 → 就地扩到段落）。它的调用是同步 COM，所以放在 **worker 线程**里、带超时，卡住的宿主应用拖不住划词链路。
 
 ## 能力面
@@ -107,11 +107,11 @@ Select text in any Windows app — the Harness model explains, summarizes, or tr
 
 本仓库根目录就是一个 **bundle 插件包**（`package.json#dsh.bundle` → `cordis.patch.yml`），且**构建产物已入库**（`lib/`）——git 源安装不需要任何构建步骤。
 
-已发布到 npm：**`dsh-select-assist@0.9.8`**（https://www.npmjs.com/package/dsh-select-assist）。
+上游包 `dsh-select-assist` 在 npm 上最新是 0.9.8；本改造版另立包名 **`dsh-select-assist-plus`**（版本 0.9.13，已发布到 npm），可用 npm 直接装，也可用 tgz 装；别装成上游的 `dsh-select-assist`。
 
 ```sh
 # npm（已发布，最省事）
-dsh plugin --profile web add dsh-select-assist
+dsh plugin --profile web add dsh-select-assist-plus
 
 # GitHub 一行装
 dsh plugin --profile web add "github:yjh248619/dsh-select-assist"
@@ -124,7 +124,7 @@ dsh plugin --profile web add .
 装完**重启 `dsh web`**（或重启承载它的桌面端）生效——bundle 层栈在启动时合成。卸载 / 更新：
 
 ```sh
-dsh plugin --profile web remove dsh-select-assist
+dsh plugin --profile web remove dsh-select-assist-plus
 dsh plugin --profile web update
 ```
 
@@ -354,9 +354,19 @@ MIT
 
 ---
 
-## 本地改造版（0.9.8，非上游发布）
+## 本改造版（0.9.13，已发布 npm）
+
+### 0.9.13（2026-11-11）
+
+- 修复 0.9.12 多窗口重构引入的回归：GDI+ 初始化被挪进“新建回答窗”流程，菜单窗先创建、首次绘制失败 → 划词后菜单全透明（能点、看不见），点不到菜单就永远建不出回答窗。现在启动即初始化 GDI+，划词菜单立即正常显示。
 
 基于 [germyGao/dsh-select-assist](https://github.com/germyGao/dsh-select-assist) `0.9.0`（MIT）。本副本的改动：
+
+- **最小化到任务栏 + 折叠图标（0.9.10）**：标题栏改成四个按钮（关闭 / 复制 / 折叠 / 最小化到任务栏）；折叠用上/下箭头（展开时显示向上=收起、收起时显示向下=展开），收成 48 DIP 标题带留在原地；最小化真正缩进 Windows 任务栏（临时挂 WS_EX_APPWINDOW + SW_MINIMIZE），点任务栏按钮还原回原位，多个窗口各自独立。
+- **原文与选中一致（0.9.10）**：UIA 读选区时拼接所有 range（Chromium/PDF 跨行选区会被拆成多段，旧版只取第一段导致原文只有半截）；拖选手势额外用剪贴板复核一次，UIA 文本与 Ctrl+C 结果不一致时以剪贴板为准。
+- **公式真排版（0.9.9）**：提示词统一要求 LaTeX 只用 `$...$` / `$$...$$`（DSH 聊天侧与 GDI+ 浮层都只认这两种写法），浮层用 MathJax 转矢量路径、GDI+ 填充绘制，分式/根号/上下标/矩阵/黑板体都能正确显示；带公式的翻译会跳过机译直接走模型，避免机译把公式毁掉。
+- **多窗口 + 折叠（0.9.9）**：每段划词各自一扇回答窗（同文同动作复用，默认最多 4 扇），互不覆盖、可各自关闭/折叠/滚动/停止；折叠把窗口收成一条标题带，留在原处不消失。
+- **偶发不弹菜单修复（0.9.9）**：双击判定窗口 420→550ms、拖选手势不再误判为双击；剪贴板核实失败（UIA 空/超时）不再直接判"没选中"——先延迟重试剪贴板、再补读一次 UIA，仍拿不准时按手势种类兜底；同一段文字在菜单收起 4 秒后再划可重新弹出。
 
 - **朗读彻底删除（0.9.5 / 0.9.6）**：菜单与标题栏的朗读按钮、SAPI `ISpVoice` 实现（`companion/native/speech.mjs`）、宿主 `speakRate/speakVolume` 设置项、图标与文档残留全部清掉；回答窗标题栏只剩「复制 / 关闭」。
 - **新增「问问」**：划词菜单第 4 段（原朗读位置）。点它会把选中的文字以 Markdown 引用（每行 `> `）填进输入框，光标就位但不自动发送——你可以补一句自己的问题再发。**分流**：在 DSH 自己的窗口里划的词落进**当前会话**；在别的应用里划的词**新开一条会话**。
@@ -383,4 +393,4 @@ MIT
 - 仅支持 **Windows**（伴生进程用 koffi + GDI+ 直接画窗口、读 UIA）。
 - 设置存在 `%APPDATA%\dsh-desktop\harness\dsh-select-assist.json`，不随包分发。
 - 若之前装过上游同名包，先卸载再装这个。
-- 这是本地改造版，不是上游发布。
+- 包名 `dsh-select-assist-plus`，与上游 `dsh-select-assist` 是两个包；装的时候别装错。

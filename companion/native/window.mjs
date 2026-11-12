@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 原生分层窗口（Layered Window）：无边框、置顶、逐像素透明、圆角/圆形，
  * 窗口就在本进程里，不依赖任何浏览器、不额外起进程。
  *
@@ -161,6 +161,7 @@ export function createNativeWindow(options) {
     UpdateLayeredWindow: user32.func('bool UpdateLayeredWindow(void *hwnd, void *dstDc, DST_NW_POINT *dst, DST_NW_SIZE *size, void *srcDc, DST_NW_POINT *src, uint32_t key, DST_NW_BLENDFUNCTION *blend, uint32_t flags)'),
     SetWindowPos: user32.func('bool SetWindowPos(void *hwnd, intptr_t after, int x, int y, int cx, int cy, uint32_t flags)'),
     ShowWindow: user32.func('bool ShowWindow(void *hwnd, int cmd)'),
+    SetWindowTextW: user32.func('bool SetWindowTextW(void *hwnd, const char16_t *title)'),
     GetCursorPos: user32.func('bool GetCursorPos(_Out_ DST_NW_POINT *pt)'),
     SetCapture: user32.func('void *SetCapture(void *hwnd)'),
     ReleaseCapture: user32.func('bool ReleaseCapture()'),
@@ -184,6 +185,7 @@ export function createNativeWindow(options) {
   const WS_POPUP = 0x80000000
   const WS_EX_LAYERED = 0x00080000
   const WS_EX_TOOLWINDOW = 0x00000080
+  const WS_EX_APPWINDOW = 0x00040000
   const WS_EX_TOPMOST = 0x00000008
   const WS_EX_NOACTIVATE = 0x08000000
   const SWP_NOSIZE = 0x0001
@@ -193,6 +195,10 @@ export function createNativeWindow(options) {
   const SWP_SHOWWINDOW = 0x0040
   const SW_HIDE = 0
   const SW_SHOWNOACTIVATE = 4
+  const SW_MINIMIZE = 6
+  const SW_RESTORE = 9
+  const SIZE_MINIMIZED = 1
+  const GWL_EXSTYLE = -20
   const ULW_ALPHA = 0x00000002
   const AC_SRC_OVER = 0x00
   const AC_SRC_ALPHA = 0x01
@@ -210,6 +216,10 @@ export function createNativeWindow(options) {
     tracking: false,
     destroyed: false,
     drag: null,
+    /** 是否已经"临时挂上任务栏"（第一次最小化时把 TOOLWINDOW 换成 APPWINDOW）。 */
+    taskbar: false,
+    /** 此刻是否缩在任务栏（系统真的最小化了，不是自绘的标题条）。 */
+    minimized: false,
   }
 
   let className = null
@@ -325,6 +335,48 @@ export function createNativeWindow(options) {
     paint()
   }
 
+  /**
+   * 让窗口在任务栏里占一个按钮（或撤掉）。
+   *
+   * 窗口创建时带 WS_EX_TOOLWINDOW：工具窗不进任务栏、不抢焦点，适合划词浮层。
+   * 用户点"最小化到任务栏"时才临时换成 WS_EX_APPWINDOW——任务栏多出一个按钮，
+   * 点它就能把窗口拉回来。shell 只在窗口显示状态变化时重扫任务栏，所以换完样式
+   * 要 hide + show 一次，否则按钮要等到下次窗口隐藏/显示才出现。
+   */
+  function setTaskbarPresence(on) {
+    if (state.hwnd === null || state.taskbar === on) return
+    const ex = Number(api.GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE))
+    const next = on
+      ? (ex & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+      : (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+    if (next !== ex) api.SetWindowLongPtrW(state.hwnd, GWL_EXSTYLE, next)
+    state.taskbar = on
+    u.ShowWindow(state.hwnd, SW_HIDE)
+    u.ShowWindow(state.hwnd, SW_SHOWNOACTIVATE)
+  }
+
+  /** 真·最小化到 Windows 任务栏（与自绘的"收成标题条"是两件事）。 */
+  function minimizeToTaskbar() {
+    if (state.hwnd === null || state.destroyed) return false
+    if (state.minimized) return true
+    setTaskbarPresence(true)
+    u.ShowWindow(state.hwnd, SW_MINIMIZE)
+    state.minimized = true
+    return true
+  }
+
+  /** 从任务栏恢复（用户点任务栏按钮时系统自己会还原，这里给 API/脚本用）。 */
+  function restoreFromTaskbar() {
+    if (state.hwnd === null || state.destroyed) return false
+    if (!state.minimized && !api.IsIconic(state.hwnd)) return false
+    u.ShowWindow(state.hwnd, SW_RESTORE)
+    state.minimized = false
+    paint()
+    // 还原后把任务栏按钮撤掉：只在"缩在任务栏里"这段时间需要它（延迟一拍，避免在 WM_SIZE 里重入）
+    if (state.taskbar) setTimeout(() => { if (!state.minimized && state.taskbar) setTaskbarPresence(false) }, 0)
+    return true
+  }
+
   /** 窗口过程。 */
   function handleMessage(hwnd, msg, wParam, lParam) {
     switch (msg) {
@@ -422,10 +474,14 @@ export function createNativeWindow(options) {
         return 0
       }
       case WM.MOVE: {
+        // 最小化到任务栏时系统会把窗口挪到 (-32000,-32000)（哨兵坐标），
+        // 这不是用户拖动，绝不能写回位置，否则保存的坐标会被污染、还原就回不来了。
+        if (state.minimized || api.IsIconic(state.hwnd)) return 0
         // 原生拖动（HTCAPTION）期间系统会连续发 WM_MOVE，不跟上的话内部坐标会过期，
         // 下一次重绘就会把窗口"拉回"旧位置（踩过：拖完窗口一滚轮就跳回去）。
         const x = (Number(lParam) & 0xffff) << 16 >> 16
         const y = (Number(lParam) >> 16) << 16 >> 16
+        if (x <= -30000 || y <= -30000) return 0
         if (x !== state.x || y !== state.y) {
           state.x = x
           state.y = y
@@ -434,6 +490,7 @@ export function createNativeWindow(options) {
         return 0
       }
       case WM.EXITSIZEMOVE: {
+        if (state.minimized || api.IsIconic(state.hwnd)) return 0
         options.onMoved?.(state.x, state.y, state.data)
         return 0
       }
@@ -463,6 +520,21 @@ export function createNativeWindow(options) {
         return 0
       }
       case WM.SIZE: {
+        const sizeKind = Number(wParam) & 0xffff
+        if (sizeKind === SIZE_MINIMIZED) {
+          // 缩进任务栏：窗口被系统收起，UpdateLayeredWindow 对最小化窗口不起作用。
+          state.minimized = true
+          options.onMinimized?.(state.data)
+          return 0
+        }
+        const wasMinimized = state.minimized
+        if (wasMinimized) {
+          state.minimized = false
+          // 先让调用方清掉"在任务栏里"的标志，再重画
+          options.onRestored?.(state.data)
+          // 用户点任务栏按钮还原时，系统不会走 restoreFromTaskbar()，这里补撤按钮
+          if (state.taskbar) setTimeout(() => { if (!state.minimized && state.taskbar) setTaskbarPresence(false) }, 0)
+        }
         const width = Number(lParam) & 0xffff
         const height = (Number(lParam) >> 16) & 0xffff
         if (width > 0 && height > 0) {
@@ -470,6 +542,8 @@ export function createNativeWindow(options) {
           state.height = height
           // 通知调用方：窗口尺寸变了（它要更新对外汇报的矩形与"用户改过的尺寸"）。
           options.onResized?.(width, height, state.data)
+          paint()
+        } else if (wasMinimized) {
           paint()
         }
         return 0
@@ -547,12 +621,32 @@ export function createNativeWindow(options) {
       state.width = width
       state.height = height
       state.visible = true
+      // 缩在任务栏里的窗口，SetWindowPos 拉不回来，必须先 SW_RESTORE（会触发 WM_SIZE 还原分支）
+      if (state.minimized || api.IsIconic(state.hwnd)) {
+        u.ShowWindow(state.hwnd, SW_RESTORE)
+        state.minimized = false
+      }
       u.SetWindowPos(state.hwnd, -1 /* HWND_TOPMOST */, Math.round(x), Math.round(y), Math.round(width), Math.round(height), SWP_NOACTIVATE | SWP_SHOWWINDOW)
       paint()
     },
     hide() {
       state.visible = false
       if (state.hwnd !== null) u.ShowWindow(state.hwnd, SW_HIDE)
+    },
+    /** 真·最小化到任务栏 / 从任务栏恢复（自绘标题条是另一条路径，见 ui.minimized）。 */
+    minimizeToTaskbar,
+    restoreFromTaskbar,
+    /** 临时挂/撤任务栏按钮（缩进任务栏时用）。 */
+    setTaskbarPresence,
+    isTaskbarMinimized: () => state.minimized,
+    /** 改窗口标题：任务栏按钮的文案就是它（每个面板写自己的动作名）。 */
+    setTitle(title) {
+      if (state.hwnd === null) return
+      try {
+        u.SetWindowTextW(state.hwnd, String(title ?? ''))
+      } catch {
+        // 标题只影响任务栏文案，失败不影响功能
+      }
     },
     invalidate,
     scale,

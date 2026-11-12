@@ -37,22 +37,43 @@ export const PRESS_SETTLE_SLOP = 12
 export const SELECTION_MOVE_SLOP = 6
 
 /**
+ * 同一段文字隔多久再划，允许菜单**重新**弹出来（毫秒）。
+ *
+ * 为什么需要：`stale-selection` 的本意是"上一次菜单留下的旧选区，别再弹一次"，但它原来
+ * 没有时间上限——文字跟上次菜单那段一样就永远判 stale。用户对同一段文字反复划词是常态
+ * （读一遍、隔会儿再划同一句；或者第一次因为别的理由没弹出来，想再划一次试试），于是
+ * "第一次之后再也弹不出来"。用户报的"划词有概率不触发"里，这一类是**持续性的**，
+ * 只是被"别的划词偶尔成功"盖住了。
+ *
+ * 时间窗怎么定：4000ms 明显长于"看一眼菜单、决定点哪个"的手速（菜单自己 MENU_TIMEOUT_MS
+ * 就活不了这么久），又远短于"重新读一遍这段文字"的间隔。窗口**内**的重复划词仍判 stale
+ * ——菜单刚收起，用户原地一动、探针又读到那段旧文字时不该再弹一次；窗口**外**按
+ * `selection-reopen` 放行。计时起点由调用方给（`options.lastShownAt`，见 menuDecision）。
+ */
+export const STALE_REOPEN_MS = 4000
+
+/**
  * 这张按下快照拍得够不够"及时"——能不能代表**手势之前**的选区。
  *
  * 判据是 `driftPx`：读数到手那一刻，指针离按下点有多远（调用方量，见 companion/main.mjs
- * 的 startPressProbe）。只有两种情形：
- * - 量到了且没离开按下点（≤ {@link PRESS_SETTLE_SLOP}）→ **可信**，当作手势之前的状态；
- * - 量到了但指针已经跑出去 → **不可信**，读数多半是这次手势自己改出来的，丢掉；
- * - 没量到（老数据、探针关掉、量位置失败）→ 照旧**可信**：少一条判据也不能反过来多一条，
- *   否则办公套件里拖形状的保护就跟着没了。
+ * 的 startPressProbe）。三种情形，**只有第一种有资格当"没改动选区"的证据**：
+ * - `true`：量到了且指针没离开按下点（≤ {@link PRESS_SETTLE_SLOP}）→ **可信**；
+ * - `false`：量到了、指针已经跑出去了 → **拍晚了**，读数多半是这次手势自己改出来的，丢掉；
+ * - `null`：位置没量到（老数据、GetCursorPos 失败、探针关掉）→ **说不准**，不下结论。
+ *
+ * 为什么"说不准"要单列，而不是像老版本那样当成可信：把它当可信时，`pressProbe` 有文字、
+ * 位置又恰好量不到，一次**重新划同一段**的手势就会被判成 unchanged-selection 而吞掉
+ * （README 里记的"极短又极快的一次拖选"就是它，用户看到的是"这一段再也划不出来"）。
+ * 宁可少一条保护——拖对象还有"矩形有没有跟着指针挪"这条兜着（见 {@link rectsMoved}）——
+ * 也不能反过来把用户真的划词吞掉。
  *
  * @param pressProbe - 按下快照摘要（`{ selection, driftPx }`，可为 null）。
- * @returns 能不能拿它去判 `unchanged-selection`。
+ * @returns `true` = 可信；`false` = 拍晚了；`null` = 说不准。
  */
-function pressSettled(pressProbe) {
-  if (pressProbe === null || pressProbe === undefined) return true
+function pressTiming(pressProbe) {
+  if (pressProbe === null || pressProbe === undefined) return null
   const drift = Number(pressProbe.driftPx)
-  if (!Number.isFinite(drift)) return true
+  if (!Number.isFinite(drift)) return null
   return drift <= PRESS_SETTLE_SLOP
 }
 
@@ -105,15 +126,18 @@ function rectsMoved(pressRects, releaseRects) {
  *   companion/main.mjs 的 startPressProbe）；
  *   **但只在该选区矩形真的跟着指针挪动时才认定是"拖对象"**：如果矩形原地没动，
  *   说明用户只是在重划同一段文字，照常往下判（DSH/浏览器里常见：菜单超时后旧选区还在，
- *   重新划同一段必须能再弹）。
+ *   重新划同一段必须能再弹）。快照本身**拍晚了**（读数到手时指针已经跑出去）或**位置没量到**
+ *   时也不拿它判 unchanged——证据不站得住就放行（见 {@link pressTiming}）。
  * - 读到选区、**这次手势碰到了它**（按下点或松开点落在选区矩形里，容差按行高算）→ 弹：
  *   这次手势选的就是它；
  * - 双击读到选区、但没有确认命中该选区 → **不弹**：不能拿附近或旧的选区当成本次选词；
  * - 拖选读到选区、手势没碰到，**但这段文字跟上一次菜单绑的那段不是同一段** → 弹：用户确实
  *   重新选了一段。几何判定会被 DPI、字符边界吸附、行距这些噪声带偏，所以文字不同就认；
- * - 读到选区、手势没碰到、文字也和上次菜单那段一模一样 → **不弹**：那是上一次划词留在
- *   应用里的旧选区，菜单已经为它弹过、也已经收起。少了这条，用户在菜单收起后随便一拖，
- *   探针照样读到那段旧文字，菜单就"再也甩不掉"。
+ * - 读到选区、手势没碰到、文字也和上次菜单那段一模一样 → **不弹**（`stale-selection`）：
+ *   那是上一次划词留在应用里的旧选区，菜单已经为它弹过、也已经收起。少了这条，用户在菜单
+ *   收起后随便一拖，探针照样读到那段旧文字，菜单就"再也甩不掉"。**但这条只在时间窗内成立**
+ *   （`STALE_REOPEN_MS`）：隔得够久的"又划了同一段"是用户真的想再看一次，按
+ *   `selection-reopen` 放行——否则同一段文字就再也划不出来了。
  *
  * 只有"什么都没读到"（应用不暴露 UIA 文本、读超时），或者普通 UIA 文本控件没有选区，
  * 才算**判不了**，这种情况一律返回 `open: null`，由调用方核实（见 companion/main.mjs
@@ -138,14 +162,22 @@ function rectsMoved(pressRects, releaseRects) {
  * @param options.pressProbe - **按下那一刻**读到的选区（见 companion/main.mjs 的
  *   startPressProbe）：用来识别"这次手势没有选出新东西"。拿不到（没拍到 / 拍得太慢）就传
  *   null——那只是少一条判据，别的分支一点不受影响。快照里的 `driftPx`（读数到手时指针离
- *   按下点多远）用来剔掉"拍晚了"的那些（见 {@link pressSettled} 与 PRESS_SETTLE_SLOP）。
+ *   按下点多远）用来剔掉"拍晚了"的那些（见 {@link pressTiming} 与 PRESS_SETTLE_SLOP）。
  *   也会带上 `rects`，用于判断选区是不是被拖动了。
+ * @param options.lastShownAt - 上一次菜单**弹出来/收起来**的 epoch ms（没有就传 null）。
+ *   只用来给 `stale-selection` 计时：距现在超过 `STALE_REOPEN_MS` 的重复划词改成
+ *   `selection-reopen` 放行。老调用方不传它也照旧工作（一直按 stale 处理），不会因为缺
+ *   这个参数改变任何既有分支。
+ * @param options.now - 当前时间（epoch ms），缺省 `Date.now()`。显式传是为了让单测能钉住
+ *   时间窗，不用真的等 4 秒。
+ * @param options.staleReopenMs - 覆盖 `STALE_REOPEN_MS`（负数/非有限值一律忽略）。
  * @param options.reason - 探针**读不到**时（probe 为 null）要报的理由，缺省 'unknown'；
  *   等满两级预算也没等到结论的那一档传 'timeout'（/status 靠它区分"探针慢"和"探针不可读"）。
  * @returns `{ open, reason }`；open 是 true（弹）/ false（不弹）/**null（UIA 判不了，去核实）**。
  *   reason 只用于诊断（/status 里能看到为什么没弹）：
  *   selection（这次手势选出来的）/ unchanged-selection（这次手势没改动选区，多半在拖动一个
- *   已选中的元素）/ stale-selection（上次留下的旧选区）/ double-not-at-gesture（双击，读到的
+ *   已选中的元素）/ stale-selection（上次留下的旧选区）/ selection-reopen（同一段文字，
+ *   但距上次菜单已经超过 STALE_REOPEN_MS）/ double-not-at-gesture（双击，读到的
  *   选区不在这次手势上）/ shell（落在桌面/任务栏这类系统外壳上）/
  *   unknown 或 timeout（UIA 判不了，open=null，交给剪贴板核实）/ clipboard（剪贴板核实到
  *   "真复制出了文字"）/ unconfirmed（核实过，没复制出文字 → 不弹）/
@@ -169,23 +201,23 @@ export function menuDecision(probe, previous, options = {}) {
   //    选中的元素**（WPS/Office 的 PPT 形状、文本框，Excel 的单元格/图表），而不是在选
   //    文字。这一条必须排在"手势碰到选区"前面：移动元素时按下点与松开点当然都落在元素里。
   //
-  //    但按下快照只有在"它拍的确实是**按下那一刻**"时才作数（见 PRESS_SETTLE_SLOP）：
-  //    浏览器里 UIA 首查常要 100ms 以上，读数回来时拖选早就结束了，读到的其实是这次手势
-  //    自己选出来的文字——那跟松开时当然一模一样。这种"拍晚了"的快照必须丢掉，否则
-  //    重复划同一段永远弹不出来。
+  //    但这条判据只在**证据都站得住**时才用（见 PRESS_SETTLE_SLOP 与 pressTiming）：
+  //    - 快照拍晚了（drift 超限）：读到的其实是这次手势自己选出来的文字，跟松开时当然
+  //      一模一样——丢掉，否则重复划同一段永远弹不出来；
+  //    - 位置压根没量到（drift 非有限 / 没有快照）：**说不准**，不能拿它判"没改动"——
+  //      老版本在这里当可信，于是"极短又极快的一次拖选"会被永久吞掉；
+  //    - 即便快照可信，也要再看"选区矩形有没有跟着指针挪动"：矩形原地没动（false）或
+  //      拿不到（null）说明用户就是在原位置重新划了同一段，不该判 unchanged-selection。
   //
-  //    即便按下快照可信且文字相同，也要再确认"选区矩形有没有跟着指针挪动"：
-  //    - 矩形原地没动（返回 false 或 null）：说明用户就是在原位置重新划了同一段，
-  //      不应该判 unchanged-selection；
-  //    - 矩形明显挪动了（返回 true）：才真是拖动对象，保持 unchanged-selection。
+  //    唯一的例外是"位置量不到、但矩形明确挪了"：矩形挪动是拖对象的正面证据，没有 drift
+  //    也照样认。其余"说不准"的组合一律**放行**继续往下判——放行不等于弹，下面照样要过
+  //    atGesture / 文字比对 / 双击那几关。
   const before = fold(options.pressProbe?.selection)
-  if (
-    before !== '' &&
-    before === selected &&
-    pressSettled(options.pressProbe) &&
-    rectsMoved(options.pressProbe?.rects, probe.rects) !== false
-  ) {
-    return { open: false, reason: 'unchanged-selection' }
+  if (before !== '' && before === selected) {
+    const timing = pressTiming(options.pressProbe)
+    const moved = rectsMoved(options.pressProbe?.rects, probe.rects)
+    if (timing === true && moved !== false) return { open: false, reason: 'unchanged-selection' }
+    if (timing === null && moved === true) return { open: false, reason: 'unchanged-selection' }
   }
   // 1) 手势碰到了这段选区（按下点或松开点就在它附近）：这次手势选的就是它。
   if (probe.atGesture === true) return { open: true, reason: 'selection' }
@@ -195,7 +227,17 @@ export function menuDecision(probe, previous, options = {}) {
   // 2) 拖选没碰到，但文字跟上次菜单那段不一样：保留拖选的几何容差兜底。
   const last = fold(previous)
   if (last === '' || selected !== last) return { open: true, reason: 'selection' }
-  // 3) 同一段文字、手势也没碰到它：上一次划词留下的旧选区，菜单已经为它弹过一次了。
+  // 3) 同一段文字、手势也没碰到它：上一次划词留下的旧选区——但只在"刚弹过"的时间窗内才算。
+  //    窗口外的重复划词是**用户又选了同一段**（同一句话反复读、或者上次没弹出来想再试），
+  //    得让他弹出来；否则这段文字就再也划不动了（见 STALE_REOPEN_MS）。
+  const now = Number.isFinite(options.now) ? options.now : Date.now()
+  const shownAt = Number(options.lastShownAt)
+  const window = Number.isFinite(options.staleReopenMs) && options.staleReopenMs >= 0
+    ? options.staleReopenMs
+    : STALE_REOPEN_MS
+  if (Number.isFinite(shownAt) && shownAt > 0 && now - shownAt > window) {
+    return { open: true, reason: 'selection-reopen' }
+  }
   return { open: false, reason: 'stale-selection' }
 }
 
@@ -232,4 +274,41 @@ export function pickSelection(sources) {
     return { text, source: typeof entry?.source === 'string' ? entry.source : 'unknown' }
   }
   return null
+}
+
+/**
+ * "弹不弹"结论的**累计计数**（给 /status 用）。
+ *
+ * 为什么不在 main.mjs 里现算：`recentDecisions` 只留最近 20 条，偶发漏弹（一晚上两三次）
+ * 很快就被后来的成功划词顶出去，事后没人能从 /status 看出"到底是哪一档在吞划词"。按
+ * reason 累计才能回答"这个版本里 unconfirmed 占多少、stale 有没有出现过"。
+ *
+ * 只记结论，不记时间/文字，不碰系统 API；main.mjs 在每次 decision 落定时 `hit()` 一下，
+ * /status 里 `snapshot()` 直接塞进去（纯 JSON，能 `structuredClone`）。
+ *
+ * @returns `{ hit(reason, open), snapshot() }`
+ *   - `hit(reason, open)`：记一次结论（reason 缺失/非字符串记成 'unknown'）；
+ *   - `snapshot()`：`{ total, opened, suppressed, deferred, reasons }`——opened = 弹了、
+ *     suppressed = 明确不弹、deferred = `open: null` 待核实（正常流程里这一档会被核实结果
+ *     覆盖，只有"决策窗口里就收尾"的调用才会留着）；reasons 是 reason → 次数。
+ */
+export function createDecisionStats() {
+  const reasons = Object.create(null)
+  let total = 0
+  let opened = 0
+  let suppressed = 0
+  let deferred = 0
+  return {
+    hit(reason, open) {
+      total += 1
+      const key = typeof reason === 'string' && reason !== '' ? reason : 'unknown'
+      reasons[key] = (reasons[key] ?? 0) + 1
+      if (open === true) opened += 1
+      else if (open === false) suppressed += 1
+      else deferred += 1
+    },
+    snapshot() {
+      return { total, opened, suppressed, deferred, reasons: { ...reasons } }
+    },
+  }
 }

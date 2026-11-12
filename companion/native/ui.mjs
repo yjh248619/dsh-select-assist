@@ -7,6 +7,7 @@
  * 尺寸：设计尺寸是 DIP（=CSS px），绘制时统一乘显示器缩放。
  */
 import { rgb } from './gdi.mjs'
+import { ensureMathReady, isMathReady, renderMath } from './math.mjs'
 
 /** 深浅主题共用同一层级：正文底色、引用底色、蓝色强调与辅助文本。 */
 export const THEMES = {
@@ -94,11 +95,13 @@ export function panelLayout(state, width = MODES.panel.width, height = MODES.pan
   }
 }
 
-/** 标题栏按钮（DIP）：复制与关闭，从**实际宽度**的右边往左排。 */
+/** 标题栏按钮（DIP）：右侧依次是收起/展开、最小化到任务栏、复制、关闭；从**实际宽度**的右边往左排。 */
 export function panelButtons(state, width = MODES.panel.width) {
-  // 从右往左排：关闭永远在最右（与 DSH 和其他窗口的习惯一致），往左是复制。
-  // 「问问」不开面板——它直接把原文引用进会话，所以标题栏只有这两个按钮。
-  const ids = ['close', 'copy']
+  // 视觉顺序（左→右）：最小化到任务栏（—）、收起/展开（⌃/⌄）、复制、关闭。
+  // 数组按"从右往左"排：close 永远在最右，往左依次是 copy、fold、min。
+  // fold = 收成标题条（窗口不缩、不离开屏幕）；min = 真缩进 Windows 任务栏。
+  // 「问问」不开面板——它直接把原文引用进会话，所以标题栏没有它。
+  const ids = ['close', 'copy', 'fold', 'min']
   const boxes = []
   let right = width - 6
   for (const id of ids) {
@@ -135,6 +138,17 @@ function actionBodyLabel(action) {
   if (action === 'summarize') return '总结'
   if (action === 'translate') return '译文'
   return '回答'
+}
+
+/**
+ * 标题栏按钮 → 图标 id。
+ *
+ * 折叠按钮的箭头表示"点一下会发生什么"：展开状态画向上箭头（收起），收起状态画向下箭头（展开）。
+ * 最小化到任务栏永远是那条下划线（—），与 Windows 窗口控件一致。
+ */
+function panelButtonIcon(state, id) {
+  if (id === 'fold') return state.minimized === true ? 'chevron-down' : 'chevron-up'
+  return id
 }
 
 function insideBox(x, y, box) {
@@ -190,6 +204,9 @@ export function panelEdgeZone(x, y, width = MODES.panel.width, height = MODES.pa
  */
 export function panelHitZone(x, y, state, width = MODES.panel.width, height = MODES.panel.height) {
   if (panelHit(x, y, state, width) !== 'body') return 'client'
+  // 最小化时只画了顶部标题条：不提供缩放手柄（拖一条 48px 的带子改大小既难抓也没意义），
+  // 标题条照旧可以拖动窗口。下方那些像素本来就是透明的（分层窗口透明处不接收鼠标）。
+  if (state.minimized === true) return y < PANEL.headerHeight ? 'caption' : 'client'
   const edge = panelEdgeZone(x, y, width, height)
   if (edge !== null) return edge
   return y < PANEL.headerHeight ? 'caption' : 'client'
@@ -234,6 +251,45 @@ export function paintMenu(painter, width, height, state, scale) {
   }
 }
 
+/**
+ * 最小化时只画顶部标题条（48 DIP）。
+ *
+ * 窗口本身**不缩尺寸**：Windows 的 GETMINMAXINFO 给回答窗压了 200×150 的最小高度，真把
+ * 窗口缩到 48px 会被系统弹回去；而且缩窗口会丢掉用户拖出来的大小。这里改成"只画一条带子"，
+ * 其余像素保持 alpha 0——分层窗口的全透明像素不接收鼠标，点不到也看不见。
+ */
+function paintPanelStrip(painter, width, state, s, p, dipWidth) {
+  const stripHeight = PANEL.headerHeight * s
+  painter.fillRoundRect(0, 0, width, stripHeight, 12 * s, p.menuColor)
+  // 底部两个圆角切成直角：最小化后窗口下沿就是这条带子的下沿。
+  painter.fillRect(0, stripHeight - 12 * s, width, 12 * s, p.menuColor)
+  // 蓝色图标底座在 16~42，标题从 52 起；右侧四个按钮（min/fold/copy/close）占 124px，标题让开。
+  painter.fillRoundRect(16 * s, 11 * s, 26 * s, 26 * s, 8 * s, p.accentSoftColor)
+  drawIcon(painter, actionIcon(state.action), 21 * s, 16 * s, 16 * s, p.accentColor, s)
+  painter.text(actionTitle(state.action), 52 * s, 13 * s, Math.max(40, dipWidth - 184) * s, 23 * s, { size: 14 * s, bold: true, color: p.labelPrimaryColor })
+  // 状态圆点：最小化后还看得出来"正在生成/已完成/失败"。
+  const statusColor =
+    state.status === 'running' || state.status === 'reading'
+      ? p.accentColor
+      : state.status === 'done'
+        ? p.successColor
+        : state.status === 'error'
+          ? p.dangerColor
+          : p.labelTertiaryColor
+  painter.fillCircle((dipWidth - 140) * s, stripHeight / 2, 4.5 * s, statusColor)
+  const hasAnswer = typeof state.answer === 'string' && state.answer !== ''
+  for (const button of panelButtons(state, dipWidth)) {
+    const disabled = button.id === 'copy' && !hasAnswer
+    const active = state.hoverButton === button.id && !disabled
+    const centerX = (button.x + button.size / 2) * s
+    const centerY = (button.y + button.size / 2) * s
+    if (active) painter.fillRoundRect(button.x * s, button.y * s, button.size * s, button.size * s, 9 * s, p.hoverColor)
+    const color = disabled ? p.disabledColor : active ? p.accentColor : p.labelTertiaryColor
+    drawIcon(painter, panelButtonIcon(state, button.id), centerX - 8 * s, centerY - 8 * s, 16 * s, color, s)
+  }
+  painter.line(0, stripHeight, width, stripHeight, p.dividerColor, s)
+}
+
 /** 画悬浮窗。 */
 export function paintPanel(painter, width, height, state, scale) {
   const p = palette(state.dark)
@@ -241,13 +297,19 @@ export function paintPanel(painter, width, height, state, scale) {
   // 窗口可以被用户拖动改大小：布局一律按**实际**宽高（DIP）算，不能钉死设计尺寸。
   const dipWidth = Math.max(200, width / s)
   const dipHeight = Math.max(160, height / s)
+  // 最小化：窗口尺寸不变（绕开系统最小高度限制），只画顶部标题条，其余像素保持全透明。
+  // 分层窗口里 alpha=0 的像素不接收鼠标，所以下面那块区域既看不见也点不到。
+  if (state.minimized === true) {
+    paintPanelStrip(painter, width, state, s, p, dipWidth)
+    return
+  }
   const layout = panelLayout(state, dipWidth, dipHeight)
   painter.fillRoundRect(0, 0, width, height, MODES.panel.radius * s, p.menuColor)
 
-  // 蓝色图标底座。
-  painter.fillRoundRect(PANEL.padding * s, 11 * s, 26 * s, 26 * s, 8 * s, p.accentSoftColor)
-  drawIcon(painter, actionIcon(state.action), (PANEL.padding + 5) * s, 16 * s, 16 * s, p.accentColor, s)
-  painter.text(actionTitle(state.action), (PANEL.padding + 36) * s, 13 * s, 60 * s, 23 * s, { size: 14 * s, bold: true, color: p.labelPrimaryColor })
+  // 蓝色图标底座在 16~42，标题从 52 起；右侧四个按钮（min/fold/copy/close）占 124px，标题让开。
+  painter.fillRoundRect(16 * s, 11 * s, 26 * s, 26 * s, 8 * s, p.accentSoftColor)
+  drawIcon(painter, actionIcon(state.action), 21 * s, 16 * s, 16 * s, p.accentColor, s)
+  painter.text(actionTitle(state.action), 52 * s, 13 * s, Math.max(40, dipWidth - 184) * s, 23 * s, { size: 14 * s, bold: true, color: p.labelPrimaryColor })
   // "DSH" 水印移除：标题栏保持干净，品牌感由整体配色和圆角传达。
   const hasAnswer = typeof state.answer === 'string' && state.answer !== ''
   for (const button of panelButtons(state, dipWidth)) {
@@ -258,7 +320,9 @@ export function paintPanel(painter, width, height, state, scale) {
     const centerY = (button.y + button.size / 2) * s
     if (active) painter.fillRoundRect(button.x * s, button.y * s, button.size * s, button.size * s, 9 * s, p.hoverColor)
     const color = disabled ? p.disabledColor : active ? p.accentColor : p.labelTertiaryColor
-    drawIcon(painter, button.id, centerX - 8 * s, centerY - 8 * s, 16 * s, color, s)
+    // 折叠按钮按"点一下会怎样"换箭头：展开时向上（收起）、收起时向下（展开）。
+    const icon = panelButtonIcon(state, button.id)
+    drawIcon(painter, icon, centerX - 8 * s, centerY - 8 * s, 16 * s, color, s)
   }
   painter.line(PANEL.padding * s, PANEL.headerHeight * s, (dipWidth - PANEL.padding) * s, PANEL.headerHeight * s, p.dividerColor, s)
 
@@ -351,7 +415,7 @@ export function paintPanel(painter, width, height, state, scale) {
   painter.strokeRoundRect(0.5 * s, 0.5 * s, width - s, height - s, MODES.panel.radius * s, p.borderColor, Math.max(1, s))
 }
 
-/** 画答案（markdown-lite），返回内容高度（物理像素）。 */
+/** 画答案（markdown-lite + LaTeX 公式），返回内容高度（物理像素）。 */
 function drawAnswer(painter, state, x, y, width, s, p, clipTop, clipBottom) {
   if (state.answer === '') {
     if (state.status === 'running' || state.status === 'reading') {
@@ -362,24 +426,50 @@ function drawAnswer(painter, state, x, y, width, s, p, clipTop, clipBottom) {
     painter.text('暂无文本输出', x, y, width, 18 * s, { size: 13 * s, color: p.labelTertiaryColor })
     return 26 * s
   }
+  // 回答里出现公式就先把 MathJax 拉起来（约 400ms，只一次）；没就绪的这几十帧先画原始 TeX，
+  // 就绪后由 main.mjs 统一刷新重绘成排版好的公式。
+  if (state.hasMath !== true) state.hasMath = hasMathSyntax(state.answer)
+  if (state.hasMath === true && !isMathReady()) void ensureMathReady()
   const blocks = parseBlocks(state.answer)
   let cursor = y
   const bodySize = 12.5 * s
   const lineHeight = 17 * s
   for (const block of blocks) {
     const near = cursor > clipTop - 600 * s && cursor < clipBottom + 600 * s
-    if (block.kind === 'heading') {
+    if (block.kind === 'math') {
+      const box = block.tex !== '' && isMathReady() ? renderMath(block.tex, { display: true, fontSize: bodySize }) : null
+      if (box === null) {
+        // 没就绪 / 这条 TeX 解析失败：把原始公式画出来（不丢内容，就绪后自动换成排版）。
+        const raw = { kind: 'paragraph', text: '$$' + block.tex + '$$' }
+        cursor += near
+          ? drawText(painter, raw.text, x, cursor + 4 * s, width, { size: bodySize, lineHeight, color: p.labelPrimaryColor })
+          : measureText(painter, raw.text, width, bodySize, lineHeight, false)
+        cursor += 4 * s
+      } else {
+        // 公式比正文区还宽时按比例缩小再渲染一次（矩阵/长式子常见），否则右侧会被裁掉。
+        const fitted = box.width > width && width > 0
+          ? renderMath(block.tex, { display: true, fontSize: Math.max(6 * s, bodySize * (width / box.width)) })
+          : null
+        const use = fitted !== null && fitted.width <= width ? fitted : box
+        const boxHeight = use.height + use.depth
+        if (near) {
+          const left = x + Math.max(0, (width - use.width) / 2)
+          paintMathBox(painter, use, left, cursor + 10 * s + use.height, p.labelPrimaryColor)
+        }
+        cursor += Math.max(boxHeight + 20 * s, lineHeight + 6 * s)
+      }
+    } else if (block.kind === 'heading') {
       const size = (block.level <= 1 ? 15 : 14) * s
       cursor += near
-        ? painter.paragraph(block.text, x, cursor + 4 * s, width, { size, lineHeight: size * 1.45, bold: true, color: p.labelPrimaryColor })
-        : measure(painter, block.text, width, size, size * 1.45, true)
+        ? drawText(painter, block.text, x, cursor + 4 * s, width, { size, lineHeight: size * 1.45, bold: true, color: p.labelPrimaryColor })
+        : measureText(painter, block.text, width, size, size * 1.45, true)
       cursor += 4 * s
     } else if (block.kind === 'bullet' || block.kind === 'ordered') {
       const marker = block.kind === 'ordered' ? String(block.marker) + '.' : '•'
       painter.text(marker, x, cursor, 18 * s, lineHeight, { size: bodySize, color: p.labelSecondaryColor })
       cursor += near
-        ? painter.paragraph(block.text, x + 14 * s, cursor, width - 14 * s, { size: bodySize, lineHeight, color: p.labelPrimaryColor })
-        : measure(painter, block.text, width - 14 * s, bodySize, lineHeight, false)
+        ? drawText(painter, block.text, x + 14 * s, cursor, width - 14 * s, { size: bodySize, lineHeight, color: p.labelPrimaryColor })
+        : measureText(painter, block.text, width - 14 * s, bodySize, lineHeight, false)
       cursor += 2 * s
     } else if (block.kind === 'code') {
       const codeSize = 11.5 * s
@@ -394,16 +484,16 @@ function drawAnswer(painter, state, x, y, width, s, p, clipTop, clipBottom) {
       cursor += boxHeight + 4 * s
     } else if (block.kind === 'quote') {
       const used = near
-        ? painter.paragraph(block.text, x + 10 * s, cursor, width - 10 * s, { size: bodySize, lineHeight, color: p.labelSecondaryColor })
-        : measure(painter, block.text, width - 10 * s, bodySize, lineHeight, false)
+        ? drawText(painter, block.text, x + 10 * s, cursor, width - 10 * s, { size: bodySize, lineHeight, color: p.labelSecondaryColor })
+        : measureText(painter, block.text, width - 10 * s, bodySize, lineHeight, false)
       if (near) painter.fillRect(x, cursor + 2 * s, 2 * s, Math.max(3, used - 3 * s), p.accentColor)
       cursor += used + 3 * s
     } else if (block.kind === 'table') {
       const rowLine = 18 * s
       for (const row of block.rows) {
         cursor += near
-          ? painter.paragraph(row, x, cursor, width, { size: 12 * s, lineHeight: rowLine, color: p.labelSecondaryColor })
-          : measure(painter, row, width, 12 * s, rowLine, false)
+          ? drawText(painter, row, x, cursor, width, { size: 12 * s, lineHeight: rowLine, color: p.labelSecondaryColor })
+          : measureText(painter, row, width, 12 * s, rowLine, false)
       }
       cursor += 3 * s
     } else if (block.kind === 'hr') {
@@ -411,16 +501,179 @@ function drawAnswer(painter, state, x, y, width, s, p, clipTop, clipBottom) {
       cursor += 16 * s
     } else {
       cursor += near
-        ? painter.paragraph(block.text, x, cursor, width, { size: bodySize, lineHeight, color: p.labelPrimaryColor })
-        : measure(painter, block.text, width, bodySize, lineHeight, false)
+        ? drawText(painter, block.text, x, cursor, width, { size: bodySize, lineHeight, color: p.labelPrimaryColor })
+        : measureText(painter, block.text, width, bodySize, lineHeight, false)
       cursor += 3 * s
     }
   }
   return cursor - (clipTop - state.scroll * s)
 }
 
-function measure(painter, text, width, size, lineHeight, bold) {
-  return painter.paragraph(text, 0, 0, width, { size, lineHeight, bold, dryRun: true })
+// ---------------------------------------------------------------- 公式（LaTeX）
+
+/** 行内公式：`$...$` 或 `\(...\)`；display 公式（`$$...$$` / `\[...\]`）由 parseBlocks 单独成块。 */
+const INLINE_MATH = /\$([^$\n]+?)\$|\\\(([\s\S]+?)\\\)/g
+/** 粗略判断"这段文本里有公式"（只用来决定要不要提前加载 MathJax）。 */
+function hasMathSyntax(text) {
+  return typeof text === 'string' && (/\$[^$\n]+\$/.test(text) || /\\\([\s\S]+?\\\)/.test(text) || /\\\[[\s\S]*?\\\]/.test(text))
+}
+function hasInlineMath(text) {
+  return typeof text === 'string' && (/\$[^$\n]+\$/.test(text) || /\\\([\s\S]+?\\\)/.test(text))
+}
+
+/** 把一行文本切成"普通文本 / 行内公式"两段（公式段带 tex）。 */
+function splitInlineMath(text) {
+  const out = []
+  let last = 0
+  INLINE_MATH.lastIndex = 0
+  let match = INLINE_MATH.exec(text)
+  while (match !== null) {
+    if (match.index > last) out.push({ type: 'text', text: text.slice(last, match.index) })
+    const tex = (match[1] ?? match[2] ?? '').trim()
+    if (tex !== '') out.push({ type: 'math', tex })
+    last = match.index + match[0].length
+    match = INLINE_MATH.exec(text)
+  }
+  if (last < text.length) out.push({ type: 'text', text: text.slice(last) })
+  return out
+}
+
+/** 公式盒（BOX 坐标：x 从 0、y 向下、基线在 y=0）画到 (x, baseline)。 */
+function paintMathBox(painter, box, x, baseline, color) {
+  const subpaths = []
+  for (const subpath of box.subpaths) {
+    const points = new Array(subpath.points.length)
+    for (let i = 0; i < subpath.points.length; i++) {
+      points[i] = [x + subpath.points[i][0], baseline + subpath.points[i][1]]
+    }
+    subpaths.push({ points })
+  }
+  painter.fillSubpaths(subpaths, color)
+  for (const rect of box.rects) {
+    painter.fillRect(x + rect.x, baseline + rect.y, rect.w, rect.h, color)
+  }
+}
+
+/** 普通文本按"词 / 单个 CJK 字 / 空格"切成可断行的 token。 */
+function flowTokens(text) {
+  const tokens = []
+  let buffer = ''
+  const flush = () => {
+    if (buffer !== '') {
+      tokens.push({ text: buffer })
+      buffer = ''
+    }
+  }
+  for (const ch of text) {
+    if (ch === ' ' || ch === '\t') {
+      flush()
+      tokens.push({ space: true })
+      continue
+    }
+    if (isCjk(ch)) {
+      flush()
+      tokens.push({ text: ch })
+      continue
+    }
+    buffer += ch
+  }
+  flush()
+  return tokens
+}
+function isCjk(ch) {
+  const code = ch.codePointAt(0)
+  return (
+    (code >= 0x2e80 && code <= 0x9fff) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xff00 && code <= 0xffef) ||
+    (code >= 0x3000 && code <= 0x303f)
+  )
+}
+
+/** 把一段普通文本按行内样式切成"普通 / 粗体 / 等宽"（`**bold**` 与 `` `code` ``），标记本身不画。 */
+function splitInlineStyles(text) {
+  const out = []
+  const re = /\*\*([^*]+)\*\*|`([^`]+)`/g
+  let last = 0
+  let match = re.exec(text)
+  while (match !== null) {
+    if (match.index > last) out.push({ type: 'text', text: text.slice(last, match.index) })
+    if (match[1] !== undefined) out.push({ type: 'bold', text: match[1] })
+    else out.push({ type: 'code', text: match[2] })
+    last = match.index + match[0].length
+    match = re.exec(text)
+  }
+  if (last < text.length) out.push({ type: 'text', text: text.slice(last) })
+  return out
+}
+
+/**
+ * 带行内公式的段落排版：文字 token 与公式盒一起按宽度断行。
+ *
+ * 基线用 `lineTop + size * 0.9` 近似（DrawString 的矩形顶对齐 + 常用中文字体 ascent 比例）；
+ * 行内公式的 ascent/depth 比文字大时把这一行的行高撑开，避免上下行贴住。
+ */
+function drawRichText(painter, text, x, y, width, options) {
+  const { size, lineHeight, color = 0xff000000, bold = false, mono = false, dryRun = false } = options
+  const segments = splitInlineMath(text)
+  let cursorX = x
+  let lineTop = y
+  let lineHeightCur = lineHeight
+  const spaceWidth = Math.max(2, painter.measure(' ', { size, bold }).width)
+  const newline = () => {
+    cursorX = x
+    lineTop += lineHeightCur
+    lineHeightCur = lineHeight
+  }
+  const wrapIfNeeded = (tokenWidth) => {
+    if (cursorX + tokenWidth > x + width && cursorX > x + 0.5) newline()
+  }
+  const paintWord = (word, wordBold = bold, wordMono = mono) => {
+    const measured = painter.measure(word, { size, bold: wordBold, mono: wordMono }).width
+    wrapIfNeeded(measured)
+    if (!dryRun) painter.text(word, cursorX, lineTop, measured + 2, lineHeightCur, { size, bold: wordBold, mono: wordMono, color })
+    cursorX += measured
+  }
+  for (const segment of segments) {
+    if (segment.type === 'math') {
+      const box = isMathReady() ? renderMath(segment.tex, { display: false, fontSize: size }) : null
+      if (box === null) {
+        // 没就绪 / 解析失败：按原始文本画（用户至少看得到 $...$ 里的内容）。
+        paintWord('$' + segment.tex + '$')
+        continue
+      }
+      const boxHeight = box.height + box.depth
+      if (boxHeight + 2 > lineHeightCur) lineHeightCur = boxHeight + 2
+      wrapIfNeeded(box.width + 1)
+      if (!dryRun) paintMathBox(painter, box, cursorX, lineTop + size * 0.9, color)
+      cursorX += box.width + 1
+    } else {
+      for (const styled of splitInlineStyles(segment.text)) {
+        const wordBold = bold || styled.type === 'bold'
+        const wordMono = mono || styled.type === 'code'
+        for (const token of flowTokens(styled.text)) {
+          if (token.space === true) {
+            const space = Math.max(2, painter.measure(' ', { size, bold: wordBold }).width)
+            wrapIfNeeded(space)
+            cursorX += space
+          } else {
+            paintWord(token.text, wordBold, wordMono)
+          }
+        }
+      }
+    }
+  }
+  return lineTop - y + lineHeightCur
+}
+
+/** 统一入口：有行内公式且 MathJax 就绪时走富文本排版，否则退回原来的纯文本段落。 */
+function drawText(painter, text, x, y, width, options) {
+  if (isMathReady() && hasInlineMath(text)) return drawRichText(painter, text, x, y, width, options)
+  return painter.paragraph(text, x, y, width, options)
+}
+
+function measureText(painter, text, width, size, lineHeight, bold) {
+  return drawText(painter, text, 0, 0, width, { size, lineHeight, bold, color: 0, dryRun: true })
 }
 
 // ---------------------------------------------------------------- Markdown-lite 解析
@@ -433,6 +686,8 @@ export function parseBlocks(text) {
   const blocks = []
   let code = null
   let table = null
+  /** 跨行的 display 公式（`$$` / `\[` 开头，收尾在同一行或后面几行）。 */
+  let math = null
   const flushTable = () => {
     if (table !== null && table.length > 0) blocks.push({ kind: 'table', rows: table })
     table = null
@@ -448,9 +703,40 @@ export function parseBlocks(text) {
       }
       continue
     }
+    // 公式块收集：`\[` / `$$` 单独成行时，后面几行都是公式，直到遇到收尾符号。
+    if (math !== null) {
+      const closeIndex = line.indexOf(math.close)
+      if (closeIndex >= 0) {
+        const tex = [...math.lines, line.slice(0, closeIndex)].join('\n').trim()
+        if (tex !== '') blocks.push({ kind: 'math', tex })
+        math = null
+      } else {
+        math.lines.push(line)
+      }
+      continue
+    }
     if (line.trim().startsWith(FENCE)) {
       flushTable()
       code = []
+      continue
+    }
+    // display 公式：`$$...$$`（可跨行）或 `\[...\]`（可跨行）。用户截图里那种
+    // "\\[ 单独一行 + 公式一行 + \\] 单独一行"的三行式靠这一支收成一个公式块。
+    const trimmed = line.trim()
+    const dollarOpen = trimmed.startsWith('$$')
+    const bracketOpen = trimmed.startsWith('\\[')
+    if (dollarOpen || bracketOpen) {
+      flushTable()
+      const open = dollarOpen ? '$$' : '\\['
+      const close = dollarOpen ? '$$' : '\\]'
+      const inner = trimmed.slice(open.length)
+      const closeIndex = inner.indexOf(close)
+      if (closeIndex >= 0) {
+        const tex = inner.slice(0, closeIndex).trim()
+        if (tex !== '') blocks.push({ kind: 'math', tex })
+      } else {
+        math = { close, lines: inner.trim() === '' ? [] : [inner.trim()] }
+      }
       continue
     }
     if (/^\s*\|.*\|\s*$/.test(line)) {
@@ -489,6 +775,8 @@ export function parseBlocks(text) {
     blocks.push({ kind: 'paragraph', text: line })
   }
   if (code !== null && code.length > 0) blocks.push({ kind: 'code', lines: code })
+  // 收尾没收完的公式块（模型偶尔少写一个 `\]`）：整段按公式画，至少不是一堆反斜杠。
+  if (math !== null && math.lines.length > 0) blocks.push({ kind: 'math', tex: math.lines.join('\n').trim() })
   flushTable()
   return blocks
 }
@@ -554,6 +842,21 @@ export function drawIcon(painter, id, x, y, size, color, s = 1) {
     }
     case 'min': {
       painter.line(px(4), py(8.5), px(12), py(8.5), color, w)
+      return
+    }
+    case 'restore': {
+      // 向上箭头：最小化之后同一个按钮变成"还原"。
+      path([[4.5, 9.5], [8, 6], [11.5, 9.5]])
+      return
+    }
+    case 'chevron-up': {
+      // 收起：点一下把窗口收成标题条（图标表示会发生什么）。
+      path([[4.5, 9.5], [8, 6], [11.5, 9.5]])
+      return
+    }
+    case 'chevron-down': {
+      // 展开：点一下把标题条还原成完整窗口。
+      path([[4.5, 6.5], [8, 10], [11.5, 6.5]])
       return
     }
     case 'close': {

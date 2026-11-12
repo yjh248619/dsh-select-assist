@@ -24,7 +24,9 @@ import { captureSelection, clampSelection } from './selection.mjs'
 import { createGdi } from './native/gdi.mjs'
 import { captureScreenRect } from './native/capture.mjs'
 import { createNativeWindow, hitTestCode } from './native/window.mjs'
-import { MODES, menuRowAt, paintMenu, paintPanel, panelHit, panelHitZone } from './native/ui.mjs'
+import { MODES, PANEL, menuRowAt, paintMenu, paintPanel, panelHit, panelHitZone } from './native/ui.mjs'
+import { ensureMathReady } from './native/math.mjs'
+import { detectAgentHostForPid, fillAgentComposer } from './native/inject.mjs'
 import { createWin32, findWindowByPid, focusWindow, monitorScaleForPoint, primaryWorkArea, windowPid, windowTitle, workAreaForPoint } from './win32.mjs'
 
 const DSH_ORIGIN = process.env.DSH_SELECTION_DSH_ORIGIN ?? 'http://127.0.0.1:3080'
@@ -124,6 +126,28 @@ const PRESS_WAIT_MS = envNumber(process.env.DSH_SELECTION_PRESS_WAIT_MS, 120)
  */
 const CONFIRM_BY_CLIPBOARD = process.env.DSH_SELECTION_CONFIRM !== '0'
 /**
+ * 剪贴板核实的单次超时（毫秒）。
+ *
+ * 原来固定 900ms：Chrome/PDF/Office 里 Ctrl+C 注入之后剪贴板序号常常一次都没动
+ * （`writes=0`），于是"还没写"被当成"没选中文字"，菜单干脆不弹——线上样本里
+ * 一半的不弹都是这一条。放宽到 1400ms，失败后还有一次重试（见 confirmByClipboard）。
+ */
+const CONFIRM_TIMEOUT_MS = envNumber(process.env.DSH_SELECTION_CONFIRM_TIMEOUT_MS, 1400)
+/** 注入 Ctrl+C 之前的静置时间：双击第二下松手时，词选区可能还没真正生效。 */
+const CONFIRM_SETTLE_MS = envNumber(process.env.DSH_SELECTION_CONFIRM_SETTLE_MS, 120)
+/** 首轮核实超时（而且剪贴板完全没被写过）后的重试间隔。 */
+const CONFIRM_RETRY_MS = envNumber(process.env.DSH_SELECTION_CONFIRM_RETRY_MS, 500)
+/** 双击探针"快速给空"（ready 但 selectionLength=0）之后再读一次的等待时间。 */
+const DOUBLE_RECHECK_MS = envNumber(process.env.DSH_SELECTION_DOUBLE_RECHECK_MS, 90)
+/**
+ * 点菜单项之后，用剪贴板复核选区的预算（毫秒）。
+ *
+ * UIA 的 TextPattern 在 Chrome/PDF 这类应用里经常只交出一部分选区（实测：拖选一整段
+ * 公式文字，UIA 只给 39 个字），回答窗的「原文」于是比用户选中的短一截。Ctrl+C 拿到的
+ * 是应用自己定义的完整选区，所以拖选手势上再核一次：不同就换掉，超时就保留 UIA 结果。
+ */
+const VERIFY_SELECTION_MS = envNumber(process.env.DSH_SELECTION_VERIFY_TIMEOUT_MS, 700)
+/**
  * 点菜单项时补读 UIA 的重试次数。
  * 那时无障碍树通常已经热了，给 1 次机会挡的是"刚巧还在冷启动"；再多就只是拖延
  * 剪贴板兜底（那才是真的读不到时的出路）。
@@ -147,23 +171,56 @@ const VK_ESCAPE = 0x1b
 const api = createWin32([KOFFI_HINT])
 const gdi = api === null ? null : createGdi(api.koffi)
 
-/** 回答窗口的业务状态（也是绘制输入）。 */
-const ui = {
-  mode: 'panel',
-  dark: true,
-  hover: -1,
-  hoverButton: null,
-  action: 'explain',
-  source: '',
-  context: '',
-  answer: '',
-  status: 'idle',
-  error: '',
-  copyFeedback: '',
-  scroll: 0,
-  contentHeight: 0,
-  viewHeight: 0,
-  stopBox: null,
+// 给伴生进程一个独立的任务栏身份。
+//
+// 不设显式 AppUserModelID 时，它和 DSH Desktop 用同一个 AUMID：窗口最小化后只会并进
+// DSH 图标的那个任务栏分组里——看不到独立按钮，等于"最小化到任务栏"没有入口。
+// 必须在创建任何窗口之前设置（Windows 只在进程第一次建窗口时读取它）。
+if (api !== null) {
+  try {
+    const shell32 = api.koffi.load('shell32.dll')
+    const setAppId = shell32.func('int SetCurrentProcessExplicitAppUserModelID(const char16_t *appId)')
+    setAppId('DeepSeek.DSH.SelectAssist')
+  } catch (error) {
+    reportError('aumid', error)
+  }
+}
+
+/** 一扇回答窗口的业务状态（也是绘制输入；每个窗口一份，互不干扰）。 */
+function createPanelUi() {
+  return {
+    mode: 'panel',
+    dark: true,
+    hover: -1,
+    hoverButton: null,
+    action: 'explain',
+    source: '',
+    context: '',
+    answer: '',
+    status: 'idle',
+    error: '',
+    copyFeedback: '',
+    scroll: 0,
+    contentHeight: 0,
+    viewHeight: 0,
+    stopBox: null,
+    /** 折叠（自绘标题条）：只画顶部 48 DIP，窗口不缩、仍在屏幕上（见 toggleFold）。 */
+    minimized: false,
+    /** 真的缩进了 Windows 任务栏（系统 ShowWindow(SW_MINIMIZE)，点任务栏按钮回来）。 */
+    taskbarMinimized: false,
+  }
+}
+
+/**
+ * 动作 → 任务栏按钮文案。
+ *
+ * 多扇窗最小化到任务栏后，任务栏上每扇窗一个按钮；写动作名（解释/总结/翻译）才分得清
+ * 哪一扇是什么（都叫"DSH 划词助手"的话就抓瞎了）。
+ */
+const ACTION_TITLES = { explain: '解释', summarize: '总结', translate: '翻译' }
+
+function panelTitle(action) {
+  return 'DSH 划词助手 · ' + (ACTION_TITLES[action] ?? '解释')
 }
 
 /**
@@ -174,8 +231,29 @@ const ui = {
  * "回答窗口里的输入内容"跟"用户看着菜单点的那段文字"对不上。
  */
 const menu = { visible: false, rect: null, scale: 1, anchor: null, hover: -1, timer: null, dark: true, selection: null }
-/** 回答窗口状态（`size` 是用户手动改过的大小，物理像素）。 */
-const panel = { mode: 'hidden', rect: null, scale: 1, position: null, size: null }
+
+/**
+ * 所有回答窗口（多窗并存）。
+ *
+ * 每项一个 record：`{ id, ui, panel, window, run, copyFeedbackTimer, createdAt }`。
+ * 旧实现只有一个窗口，新一次划词会把上一段的内容顶掉；现在每次动作单独开一扇，
+ * 用户可以左右对照着看（上限 MAX_PANELS，超出关最旧的）。
+ */
+const panels = []
+/** 响应窗口并存上限。 */
+const MAX_PANELS = Math.max(1, Math.min(8, Number(process.env.DSH_SELECTION_MAX_PANELS ?? 4) || 4))
+/** 用户手动改过的窗口大小（物理像素）：新窗口沿用，省得每次重拖。 */
+let preferredPanelSize = null
+let panelSeq = 0
+/**
+ * GDI+ 必须在任何窗口第一次 paint 之前启动。
+ *
+ * 菜单窗是启动时就创建好的，用户第一次划词它就会 paint；如果等到"第一次新建回答窗"
+ * 才 startup，菜单会画成一整块全透明——逻辑上 visible=true、能点的区域也在，但屏幕上
+ * 什么都看不到（"划词不触发"）。多窗口重构时曾把这个启动挪进 createPanel，重启后
+ * 正好踩中：菜单看不见 → 点不到 → 回答窗永远不创建 → GDI+ 永远不启动。
+ */
+let gdiReady = gdi !== null && gdi.startup() === true
 
 const state = {
   selection: null,
@@ -192,13 +270,18 @@ const state = {
   lastPressProbe: null,
   /** 最近一次"用剪贴板核实有没有选中文字"的报告（UIA 判不了时才走这一步）。 */
   lastConfirm: null,
+  /** 最近一次"用剪贴板复核选区原文"的结果（UIA 只给半截时用，排障用）。 */
+  lastVerify: null,
   /** 最近一次"弹不弹菜单"的结论与理由（呼不出来时看这里）。 */
   lastMenuDecision: null,
   /** 最近一次"点菜单项之后用了哪个来源的文字"。 */
   lastResolve: null,
   /** 最近一次「问问」的分流判定（sourcePid / 前台窗口 / mode，排障用）。 */
   lastAsk: null,
-  run: null,
+  /** 上一次菜单**弹出**的时刻（"同一段文字过一会儿再划要能再弹"要用它）。 */
+  lastMenuShownAt: 0,
+  /** 每个 reason 各出现过几次（偶发不弹时一眼看出是哪条判据在拦）。 */
+  reasonCounts: {},
   startedAt: Date.now(),
   errors: [],
 }
@@ -249,9 +332,19 @@ let deciding = false
  * @param {number} opts.gap - 与选区留多少像素空隙。
  * @returns {object} 默认位置 `{x,y}`。
  */
-function placePanelBySelection({ workArea, selection, width, height, gap }) {
+function placePanelBySelection({ workArea, selection, width, height, gap, occupied = [] }) {
+  const clampToWork = (rect) => ({
+    x: Math.min(Math.max(rect.x, workArea.left), Math.max(workArea.left, workArea.right - width)),
+    y: Math.min(Math.max(rect.y, workArea.top), Math.max(workArea.top, workArea.bottom - height)),
+  })
+  const overlaps = (rect) => occupied.some((other) =>
+    rect.x < other.x + other.width + 6 &&
+    rect.x + width > other.x - 6 &&
+    rect.y < other.y + other.height + 6 &&
+    rect.y + height > other.y - 6
+  )
   if (selection === null || selection === undefined) {
-    return { x: workArea.right - width - 20, y: workArea.bottom - height - 20 }
+    return clampToWork({ x: workArea.right - width - 20, y: workArea.bottom - height - 20 })
   }
   const sx = selection.x
   const sy = selection.y
@@ -269,9 +362,24 @@ function placePanelBySelection({ workArea, selection, width, height, gap }) {
     p.y >= workArea.top &&
     p.y + height <= workArea.bottom
   )
-  if (fits.length > 0) return fits[0]
-  // 全放不下：贴到右下角的兜底位置
-  return { x: workArea.right - width - 20, y: workArea.bottom - height - 20 }
+  const fallback = { x: workArea.right - width - 20, y: workArea.bottom - height - 20 }
+  const base = fits.length > 0 ? fits[0] : fallback
+  if (occupied.length === 0) return base
+  // 已有别的回答窗占着这块：
+  // 1) 先试并排（放到所有已有窗口的左边），只要还有空间就完全不叠。
+  const leftMost = Math.min(...occupied.map((rect) => rect.x))
+  const besideLeft = clampToWork({ x: leftMost - width - 8, y: base.y })
+  if (leftMost - width - 8 >= workArea.left && !overlaps(besideLeft)) return besideLeft
+  // 2) 再试上下堆叠（放到所有已有窗口的上方）。
+  const topMost = Math.min(...occupied.map((rect) => rect.y))
+  const stackedUp = clampToWork({ x: base.x, y: topMost - height - 8 })
+  if (topMost - height - 8 >= workArea.top && !overlaps(stackedUp)) return stackedUp
+  // 3) 空间实在不够：按 24 DIP 阶梯往右下让，最多让 16 步；让不开就叠着放（标题栏仍然露出来）。
+  for (let step = 1; step <= 16; step += 1) {
+    const candidate = clampToWork({ x: base.x + step * 24, y: base.y + step * 24 })
+    if (!overlaps(candidate)) return candidate
+  }
+  return clampToWork({ x: base.x + 24, y: base.y + 24 })
 }
 
 function startPressProbe(press) {
@@ -380,177 +488,294 @@ function systemDark() {
   return dark
 }
 
-// ---------------------------------------------------------------- 回答窗口（面板 / 悬浮球）
-
-const mainWindow = api !== null && gdi !== null && gdi.startup()
-  ? createNativeWindow({
-      api,
-      gdi,
-      className: 'DshSelMainWnd',
-      title: 'DSH 划词助手',
-      // 缩放下限（DIP）：再小布局就没法看了
-      minSize: { width: 260, height: 200 },
-      initialState: ui,
-      onPaint(painter, width, height, data, scale) {
-        paintPanel(painter, width, height, data, scale)
-      },
-      onHitTest(x, y, data) {
-        return hitZone(x, y, data)
-      },
-      onHover(x, y, data) {
-        const scale = mainWindow.scale()
-        if (x < 0) {
-          const changed = data.hover !== -1 || data.hoverButton !== null
-          data.hover = -1
-          data.hoverButton = null
-          return changed
-        }
-        const button = y / scale < 44 ? panelHit(x / scale, y / scale, data, currentPanelSize().width) : null
-        const next = button === 'body' ? null : button
-        if (next !== data.hoverButton) {
-          data.hoverButton = next
-          return true
-        }
-        return false
-      },
-      onMouseDown() {
-        // 拖动交给标题栏（HTCAPTION），客户区一律按点击处理
-        return 'click'
-      },
-      onDragEnd(x, y) {
-        panel.position = { x, y }
-      },
-      onResized(width, height) {
-        // 创建期（窗口是 10×10 的占位尺寸）与隐藏期都会收到 WM_SIZE，不能当作用户改过大小
-        // ——踩过：把创建期的 10×10 记成"用户尺寸"，回答窗口直接以 10×10 打开。
-        if (panel.mode === 'hidden') return
-        const scale = mainWindow.scale()
-        if (width < 200 * scale || height < 150 * scale) return
-        // 用户手动改过大小：记住它（下次打开仍用这个尺寸），并同步对外汇报的矩形
-        // —— 否则命中判断与 /capture 会按旧尺寸错位。
-        panel.size = { width, height }
-        if (panel.rect !== null) panel.rect = { ...panel.rect, width, height }
-      },
-      onMoved(x, y) {
-        // 原生拖动（标题栏）之后同步位置，避免下一次重绘把窗口拉回去。
-        // 窗口隐藏时不记：创建期与隐藏期都会收到 WM_MOVE（例如 -32000 的初始位置）。
-        if (panel.mode === 'hidden') return
-        panel.position = { x, y }
-        // 同时修正对外汇报的矩形：否则 /capture 之类会按旧坐标抓错区域
-        if (panel.rect !== null) panel.rect = { ...panel.rect, x, y }
-      },
-      onClick(x, y, data) {
-        try {
-          return clickMain(x / mainWindow.scale(), y / mainWindow.scale(), data)
-        } catch (error) {
-          reportError('click', error)
-          return false
-        }
-      },
-      onRightClick() {
-        // 只有标题栏的关闭按钮会关掉窗口（悬浮球已移除，右键不再有特殊含义）
-        return false
-      },
-      onWheel(delta, data) {
-        if (data.mode !== 'panel') return false
-        const maxScroll = Math.max(0, data.contentHeight - data.viewHeight)
-        const next = Math.min(maxScroll, Math.max(0, data.scroll - Math.sign(delta) * 60))
-        if (next === data.scroll) return false
-        data.scroll = next
-        return true
-      },
-      onDpiChanged() {
-        if (panel.mode !== 'hidden') applyMainMode(panel.mode)
-      },
-      onError(error) {
-        reportError('main-window', error)
-      },
-    })
-  : null
+// ---------------------------------------------------------------- 回答窗口（可并存多扇）
 
 /**
- * 回答窗口的实际尺寸（DIP）+ 缩放。
+ * 已有窗口里找一扇"同一段文字、同一种动作"的：复用它、重新跑一遍。
  *
- * 尺寸一律取**窗口当前的实际尺寸**：用户可以把窗口拖大拖小，命中区要是还按
- * 设计尺寸算，四边四角的缩放手柄都会跑偏（踩过：改完大小后右下角手柄偏出窗口）。
+ * 用户要的"并存"是**不同划词之间**各自留一扇；同一段文字重复点同一个动作，
+ * 再叠一扇纯属添乱。
  */
-function currentPanelSize() {
-  const scale = mainWindow === null ? 1 : mainWindow.scale()
-  const size = mainWindow === null ? { width: MODES.panel.width * scale, height: MODES.panel.height * scale } : mainWindow.size()
+function findReusablePanel(action, text) {
+  if (typeof text !== 'string' || text.trim() === '') return null
+  const found = panels.find((record) =>
+    record.panel.mode !== 'hidden' && record.ui.action === action && record.ui.source === text
+  )
+  return found ?? null
+}
+
+/** 最近显示、且此刻真正在屏幕上的一扇窗口（/status、/click 等旧接口的默认目标）。 */
+function activePanel() {
+  for (let i = panels.length - 1; i >= 0; i -= 1) {
+    const record = panels[i]
+    if (record.panel.mode !== 'hidden' && record.ui.taskbarMinimized !== true) return record
+  }
+  return null
+}
+
+/**
+ * 一扇窗口在屏幕上的有效矩形。
+ *
+ * 折叠（自绘标题条）时只占顶部标题条：手势忽略区与"别叠在一起"的避让都要按这个算，
+ * 否则收起来的窗口会用一整块透明区域吞掉用户下面的划词。真缩进任务栏时窗口不在屏幕上，
+ * 返回 null（不参与避让，也不拦手势）。
+ */
+function panelScreenRect(record) {
+  if (record.ui.taskbarMinimized === true) return null
+  const rect = record.panel.rect
+  if (rect === null) return null
+  if (record.ui.minimized) {
+    const header = Math.min(rect.height, Math.round(PANEL.headerHeight * record.panel.scale))
+    return { ...rect, width: rect.width, height: header }
+  }
+  return rect
+}
+
+/**
+ * 建一扇原生窗口（callbacks 闭包引用它自己的 record，互不干扰）。
+ *
+ * className 必须每扇唯一：窗口类注册是全局的，同名第二次注册会复用第一个实例的
+ * 窗口过程——两扇窗口的点击/绘制会串到同一份状态上（[踩过]）。
+ */
+function createPanelWindow(record) {
+  const window = createNativeWindow({
+    api,
+    gdi,
+    className: 'DshSelMainWnd-' + record.id,
+    title: 'DSH 划词助手',
+    // 缩放下限（DIP）：再小布局就没法看了
+    minSize: { width: 260, height: 200 },
+    initialState: record.ui,
+    onPaint(painter, width, height, data, scale) {
+      paintPanel(painter, width, height, data, scale)
+    },
+    onHitTest(x, y) {
+      return hitZone(record, x, y)
+    },
+    onHover(x, y, data) {
+      const scale = window.scale()
+      if (x < 0) {
+        const changed = data.hover !== -1 || data.hoverButton !== null
+        data.hover = -1
+        data.hoverButton = null
+        return changed
+      }
+      const button = y / scale < 44 ? panelHit(x / scale, y / scale, data, currentPanelSize(record).width) : null
+      const next = button === 'body' ? null : button
+      if (next !== data.hoverButton) {
+        data.hoverButton = next
+        return true
+      }
+      return false
+    },
+    onMouseDown() {
+      // 拖动交给标题栏（HTCAPTION），客户区一律按点击处理
+      return 'click'
+    },
+    onDragEnd(x, y) {
+      record.panel.position = { x, y }
+    },
+    onResized(width, height) {
+      // 创建期（窗口是 10×10 的占位尺寸）与隐藏期都会收到 WM_SIZE，不能当作用户改过大小
+      // ——踩过：把创建期的 10×10 记成"用户尺寸"，回答窗口直接以 10×10 打开。
+      if (record.panel.mode === 'hidden') return
+      const s = window.scale()
+      if (width < 200 * s || height < 150 * s) return
+      // 用户手动改过大小：记住它（新窗口也沿用这个尺寸），并同步对外汇报的矩形
+      record.panel.size = { width, height }
+      preferredPanelSize = { width, height }
+      if (record.panel.rect !== null) record.panel.rect = { ...record.panel.rect, width, height }
+    },
+    onMoved(x, y) {
+      // 原生拖动（标题栏）之后同步位置，避免下一次重绘把窗口拉回去。
+      if (record.panel.mode === 'hidden') return
+      // 缩在任务栏里时系统会把窗口挪到 -32000（哨兵坐标），不能当用户拖动记下来
+      if (record.ui.taskbarMinimized === true || x <= -30000 || y <= -30000) return
+      record.panel.position = { x, y }
+      if (record.panel.rect !== null) record.panel.rect = { ...record.panel.rect, x, y }
+    },
+    onClick(x, y, data) {
+      try {
+        return clickPanel(record, x / window.scale(), y / window.scale(), data)
+      } catch (error) {
+        reportError('click', error)
+        return false
+      }
+    },
+    onRightClick() {
+      return false
+    },
+    onWheel(delta, data) {
+      if (data.mode !== 'panel') return false
+      const maxScroll = Math.max(0, data.contentHeight - data.viewHeight)
+      const next = Math.min(maxScroll, Math.max(0, data.scroll - Math.sign(delta) * 60))
+      if (next === data.scroll) return false
+      data.scroll = next
+      return true
+    },
+    onDpiChanged() {
+      if (record.panel.mode !== 'hidden') applyPanelMode(record, record.panel.mode)
+    },
+    onMinimized() {
+      // 系统把窗口收进任务栏：屏幕上的矩形没了，划词手势不要再避开它。
+      record.ui.taskbarMinimized = true
+      record.ui.hoverButton = null
+      record.ui.hover = -1
+    },
+    onRestored() {
+      // 从任务栏回来（点任务栏按钮或 API）：清标志并重画，分层窗口的内容要重新提交。
+      record.ui.taskbarMinimized = false
+      record.ui.hoverButton = null
+      record.ui.hover = -1
+      const rect = record.panel.rect
+      if (rect !== null && rect.width > 0 && rect.height > 0 && rect.x > -30000 && rect.y > -30000) {
+        // 系统把窗口还原到最小化前的位置；再显式 show 一次兜底（顺带重画）
+        setTimeout(() => {
+          if (!panelReady(record) || record.ui.taskbarMinimized === true) return
+          record.window.show(rect.x, rect.y, rect.width, rect.height)
+        }, 0)
+      }
+      refreshPanel(record)
+    },
+    onError(error) {
+      reportError('panel-window', error)
+    },
+  })
+  if (window === null) return null
+  window.create()
+  window.hide()
+  record.window = window
+  return window
+}
+
+/** 新建一扇回答窗口（创建后不可见，登记进 panels）。 */
+function createPanel() {
+  if (api === null || gdi === null || !gdiReady) return null
+  panelSeq += 1
+  const record = {
+    id: panelSeq,
+    ui: createPanelUi(),
+    panel: { mode: 'hidden', rect: null, scale: 1, position: null, size: null },
+    window: null,
+    run: null,
+    copyFeedbackTimer: null,
+    createdAt: Date.now(),
+  }
+  if (createPanelWindow(record) === null) return null
+  // 任务栏按钮的文案（这扇窗缩进任务栏时用户看到的就是它）
+  record.window.setTitle(panelTitle(record.ui.action))
+  panels.push(record)
+  if (panels.length > MAX_PANELS) {
+    const oldest = panels
+      .filter((item) => item !== record)
+      .sort((a, b) => a.createdAt - b.createdAt)[0]
+    if (oldest !== undefined) closePanel(oldest)
+  }
+  return record
+}
+
+/**
+ * 取一扇能装下这次动作的窗口：同文同动作已有 → 复用；否则新建。
+ * 建不出来（系统级划词不可用）返回 null。
+ */
+function panelForAction(action, selection) {
+  const text = selection === null || selection === undefined ? '' : selection.text
+  const reused = findReusablePanel(action, text)
+  if (reused !== null) return reused
+  return createPanel()
+}
+
+/** 窗口是否可用。 */
+function panelReady(record) {
+  return record !== null && record !== undefined && record.window !== null && record.window.isAlive()
+}
+
+/** 窗口的实际尺寸（DIP）+ 缩放。 */
+function currentPanelSize(record) {
+  const ready = panelReady(record)
+  const fallbackScale = record === null || record === undefined ? 1 : (record.panel.scale || 1)
+  const scale = ready ? record.window.scale() : fallbackScale
+  const size = ready ? record.window.size() : { width: MODES.panel.width * scale, height: MODES.panel.height * scale }
   return { scale, width: Math.max(1, size.width) / scale, height: Math.max(1, size.height) / scale }
 }
 
 /**
- * 回答窗口的命中区（物理 → 语义）。
+ * 窗口的命中区（物理 → 语义）。
  *
  * 区在 ui.mjs 的 panelHitZone 里（纯函数、可单测）：**四边 + 四角，八个方向都能
  * 用鼠标拖着改大小**。优先级是 标题栏按钮 / 页脚「停止」 > 缩放手柄 > 标题栏拖动 >
  * 客户区——上边最外面 6 DIP 是缩放手柄，再往下才轮到 HTCAPTION 拖动，两者不打架。
  */
-function hitZone(x, y, data) {
-  const { scale, width, height } = currentPanelSize()
-  return panelHitZone(x / scale, y / scale, data, width, height)
+function hitZone(record, x, y) {
+  const { scale, width, height } = currentPanelSize(record)
+  return panelHitZone(x / scale, y / scale, record.ui, width, height)
 }
 
-/** 回答窗口标题栏上的点击（复制 / 关闭 / 停止）。 */
-function clickMain(cssX, cssY, data) {
-  const hit = panelHit(cssX, cssY, data, currentPanelSize().width)
+/** 标题栏上的点击（折叠 / 最小化到任务栏 / 复制 / 关闭 / 停止）。 */
+function clickPanel(record, cssX, cssY, data) {
+  const hit = panelHit(cssX, cssY, data, currentPanelSize(record).width)
+  if (hit === 'fold') {
+    toggleFold(record)
+    return true
+  }
+  if (hit === 'min') {
+    minimizeToTaskbar(record)
+    return true
+  }
   if (hit === 'copy') {
-    void copyAnswer()
+    void copyAnswer(record)
     return true
   }
   if (hit === 'close') {
-    hideMain()
+    closePanel(record)
     return true
   }
   if (hit === 'stop') {
-    void stopRun()
+    void stopRun(record)
     return true
   }
   return true
 }
 
-/** 页脚回执的定时器。 */
-let copyFeedbackTimer = null
-
-/** 回答窗口是否可用。 */
-function mainReady() {
-  return mainWindow !== null && mainWindow.isAlive()
-}
-
-/** 把回答状态推给窗口并重绘。 */
-function refreshMain() {
-  if (!mainReady()) return
-  mainWindow.setState({
-    mode: ui.mode,
-    dark: ui.dark,
-    hover: ui.hover,
-    hoverButton: ui.hoverButton,
-    action: ui.action,
-    source: ui.source,
-    answer: ui.answer,
-    context: ui.context,
-    status: ui.status,
-    error: ui.error,
-    copyFeedback: ui.copyFeedback,
-    scroll: ui.scroll,
-    contentHeight: ui.contentHeight,
-    viewHeight: ui.viewHeight,
-    stopBox: ui.stopBox,
+/** 把一扇窗口的状态推给它的原生窗口并重绘。 */
+function refreshPanel(record) {
+  if (!panelReady(record)) return
+  record.window.setState({
+    mode: record.ui.mode,
+    dark: record.ui.dark,
+    hover: record.ui.hover,
+    hoverButton: record.ui.hoverButton,
+    action: record.ui.action,
+    source: record.ui.source,
+    answer: record.ui.answer,
+    context: record.ui.context,
+    status: record.ui.status,
+    error: record.ui.error,
+    copyFeedback: record.ui.copyFeedback,
+    scroll: record.ui.scroll,
+    contentHeight: record.ui.contentHeight,
+    viewHeight: record.ui.viewHeight,
+    stopBox: record.ui.stopBox,
+    minimized: record.ui.minimized,
+    taskbarMinimized: record.ui.taskbarMinimized,
   })
 }
 
 /**
- * 显示回答窗口并定位（只有"面板"一种形态：悬浮球与最小化都已移除）。
- * 原生分层窗口没有边框，尺寸即内容尺寸。
+ * 显示并定位一扇窗口。
+ *
+ * 位置优先级：用户手动拖过的位置（这扇窗自己的）→ 跟随这次选区 → 与已有窗口
+ * 错开（见 placePanelBySelection 的 occupied）。尺寸沿用用户最近一次手动改过的大小。
  */
-function applyMainMode(mode) {
-  if (!mainReady()) return null
+function applyPanelMode(record, mode) {
+  if (!panelReady(record)) return null
   if (mode === 'hidden') {
-    hideMain()
+    hidePanel(record)
     return null
   }
-  ui.dark = systemDark()
+  // 缩在任务栏里的窗口要显示：先还原，否则 Show/SetWindowPos 拉不回它
+  if (record.ui.taskbarMinimized === true) restoreFromTaskbar(record)
+  record.ui.dark = systemDark()
   const css = MODES[mode]
   const anchor = state.selection !== null ? { x: state.selection.x, y: state.selection.y } : null
   const work = anchor !== null ? workAreaForPoint(api, anchor.x, anchor.y) : primaryWorkArea(api)
@@ -558,38 +783,146 @@ function applyMainMode(mode) {
     ? monitorScaleForPoint(api, anchor.x, anchor.y)
     : monitorScaleForPoint(api, (work.left + work.right) / 2, (work.top + work.bottom) / 2)
   // 用户手动改过大小就沿用他的尺寸（否则用设计尺寸），再夹回工作区。
-  const preferred = panel.size ?? { width: css.width * scale, height: css.height * scale }
+  const preferred = record.panel.size ?? preferredPanelSize ?? { width: css.width * scale, height: css.height * scale }
   const width = Math.min(Math.round(preferred.width), Math.max(240, work.right - work.left))
   const height = Math.min(Math.round(preferred.height), Math.max(180, work.bottom - work.top))
-  const base = panel.position ?? placePanelBySelection({
+  const occupied = panels
+    .filter((item) => item !== record)
+    .map(panelScreenRect)
+    .filter((rect) => rect !== null)
+  const base = record.panel.position ?? placePanelBySelection({
     workArea: work,
     selection: anchor,
     width,
     height,
     gap: 12,
+    occupied,
   })
   const x = Math.min(Math.max(base.x, work.left), Math.max(work.left, work.right - width))
   const y = Math.min(Math.max(base.y, work.top), Math.max(work.top, work.bottom - height))
 
-  ui.mode = mode
-  panel.mode = mode
-  panel.scale = scale
-  panel.rect = { x, y, width, height }
-  panel.position = { x, y }
-  if (mode === 'panel') ui.scroll = 0
-  refreshMain()
-  mainWindow.show(x, y, width, height)
+  record.ui.mode = mode
+  record.panel.mode = mode
+  record.panel.scale = scale
+  record.panel.rect = { x, y, width, height }
+  record.panel.position = { x, y }
+  if (mode === 'panel') record.ui.scroll = 0
+  refreshPanel(record)
+  record.window.show(x, y, width, height)
   return { x, y, width, height, scale, mode }
 }
 
-/** 关闭回答窗口（只有手动关闭会走到这里）。 */
-function hideMain() {
-  if (!mainReady()) return
-  mainWindow.hide()
-  panel.mode = 'hidden'
-  ui.mode = 'hidden'
+/** 隐藏一扇窗口（保留 record 与内容；关窗用 closePanel）。 */
+function hidePanel(record) {
+  // 任务栏里还缩着一扇的话先还原再藏，不然 ShowWindow(SW_HIDE) 之后它仍记着"最小化"
+  if (panelReady(record) && record.ui.taskbarMinimized === true) {
+    record.window.restoreFromTaskbar()
+    record.ui.taskbarMinimized = false
+  }
+  if (panelReady(record)) record.window.hide()
+  record.panel.mode = 'hidden'
+  record.ui.mode = 'hidden'
 }
 
+/** 隐藏所有窗口（/window 的 hidden 与手势之外的全局收起用）。 */
+function hideAllPanels() {
+  for (const record of panels) hidePanel(record)
+}
+
+/**
+ * 把所有可见窗口按当前状态重绘一遍。
+ *
+ * 现在最需要它的时刻是"公式渲染器刚加载完"：回答里的 LaTeX 在 MathJax 就绪前只能先画原始
+ * TeX，就绪后得有人触发一次重绘才会变成排版好的公式。
+ */
+function refreshAllPanels() {
+  for (const record of panels) {
+    if (record.panel.mode === 'hidden' || record.window === null || record.ui.taskbarMinimized === true) continue
+    refreshPanel(record)
+  }
+}
+
+/**
+ * 关掉一扇窗口：先停流，再销毁原生窗口，最后从 panels 移除。
+ *
+ * 「关闭」与「折叠」是两件事：关闭 = 这扇窗没了（下次动作重新开）；折叠 =
+ * 还在，只是收成标题条（见 toggleFold）。最小化到任务栏见 minimizeToTaskbar。
+ */
+function closePanel(record) {
+  abortPanelRun(record)
+  if (record.copyFeedbackTimer !== null) {
+    clearTimeout(record.copyFeedbackTimer)
+    record.copyFeedbackTimer = null
+  }
+  if (panelReady(record)) record.window.destroy()
+  record.window = null
+  record.panel.mode = 'hidden'
+  record.ui.mode = 'hidden'
+  const index = panels.indexOf(record)
+  if (index !== -1) panels.splice(index, 1)
+}
+
+/**
+ * 折叠 / 展开（自绘标题条，窗口还在屏幕上）。
+ *
+ * **不改窗口尺寸**：只切换 ui.minimized 并重绘——折叠时只画顶部标题条，其余像素
+ * 保持透明（分层窗口的透明像素本来就不接收鼠标），所以既能"收起来"、又不触发
+ * GETMINMAXINFO 的最小高度限制，展开时也不用重新摆位置。
+ */
+function toggleFold(record) {
+  record.ui.minimized = record.ui.minimized !== true
+  record.ui.hoverButton = null
+  record.ui.hover = -1
+  refreshPanel(record)
+}
+
+/**
+ * 真·最小化到 Windows 任务栏。
+ *
+ * 与折叠的区别：窗口从屏幕上消失、任务栏多出一个按钮（系统级最小化），点按钮回来。
+ * 窗口第一次最小化时才挂任务栏（见 native/window.mjs 的 setTaskbarPresence），
+ * 平时仍是工具窗，不占任务栏。
+ */
+function minimizeToTaskbar(record) {
+  if (!panelReady(record)) return false
+  if (record.ui.taskbarMinimized === true) return true
+  const ok = record.window.minimizeToTaskbar() === true
+  if (!ok) return false
+  record.ui.taskbarMinimized = true
+  record.ui.hoverButton = null
+  record.ui.hover = -1
+  return true
+}
+
+/** 从任务栏恢复一扇窗口（任务栏按钮点击走系统默认还原，这里给 /window 等接口用）。 */
+function restoreFromTaskbar(record) {
+  if (!panelReady(record)) return false
+  if (record.ui.taskbarMinimized !== true) return false
+  record.ui.taskbarMinimized = false
+  record.ui.hoverButton = null
+  record.ui.hover = -1
+  const ok = record.window.restoreFromTaskbar() === true
+  // 还原后把窗口放回原位：最小化期间系统会把窗口挪到 -32000，不重新 show 就会停在屏幕外
+  const rect = record.panel.rect
+  const good = rect !== null && rect.width > 0 && rect.height > 0 && rect.x > -30000 && rect.y > -30000
+  if (good) {
+    record.window.show(rect.x, rect.y, rect.width, rect.height)
+  } else {
+    record.panel.position = null
+    record.panel.rect = null
+    applyPanelMode(record, 'panel')
+    return ok
+  }
+  refreshPanel(record)
+  return ok
+}
+
+/** 停下某扇窗口正在跑的流。 */
+function abortPanelRun(record) {
+  if (record === null || record === undefined) return
+  record.run?.abort?.()
+  record.run = null
+}
 // ---------------------------------------------------------------- 划词菜单窗口
 
 const menuUi = { dark: true, hover: -1 }
@@ -635,15 +968,17 @@ const menuWindow = api !== null && gdi !== null
     })
   : null
 
-// 两个窗口都在这里创建（不可见），之后按需 show / hide
-if (mainWindow !== null) {
-  mainWindow.create()
-  mainWindow.hide()
-}
+// 菜单窗口在这里创建（不可见），之后按需 show / hide；回答窗口是懒创建的（openPanel 时）。
 if (menuWindow !== null) {
   menuWindow.create()
   menuWindow.hide()
 }
+
+// 公式渲染（MathJax）是懒加载的：进程一起来就先拉一次，加载完成后把已经画出来的窗口重绘
+// 一遍——否则第一次划词时那几百毫秒里公式只能先显示原始 TeX。加载失败也不影响文字回答。
+void ensureMathReady().then((ready) => {
+  if (ready) refreshAllPanels()
+})
 
 function menuReady() {
   return menuWindow !== null && menuWindow.isAlive()
@@ -735,6 +1070,14 @@ async function waitFor(promise, ms) {
   }
 }
 
+/** 等一小会儿（定时器 unref：不拖住进程退出）。 */
+function delay(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    timer.unref?.()
+  })
+}
+
 /**
  * 手势落下后等一个"弹不弹"的结论。
  *
@@ -754,10 +1097,10 @@ async function waitFor(promise, ms) {
  *   UIA 首查慢，拖完才回来的读数会把这次手势自己选出来的文字当成"按下就已经选着"。
  * @returns `{ open, reason }`（见 policy.mjs 的 menuDecision）。
  */
-async function decideMenu(pending, budgetMs, previous, kind, pressSnapshot = null) {
+async function decideMenu(pending, budgetMs, previous, kind, pressSnapshot = null, lastShownAt = 0, point = null) {
   // `MENU_DECIDE_MS=0` 是"手势一到就弹、不做任何过滤"的逃生舱：连剪贴板核实都不要走。
   if (budgetMs <= 0) return unknownFallback(kind)
-  if (contextReader === null) return menuDecision(null, previous, { kind })
+  if (contextReader === null) return menuDecision(null, previous, { kind, lastShownAt })
   // 按下快照通常早就回来了（它在按下那一刻就发出去了），这一步几乎不花时间；只给
   // PRESS_WAIT_MS 这么多宽限——超时就当没拍到（少一条判据，不拦这次划词）。
   const pressPending = pressSnapshot?.pending ?? null
@@ -768,12 +1111,23 @@ async function decideMenu(pending, budgetMs, previous, kind, pressSnapshot = nul
     ? null
     : { ...pressResult, driftPx: snapshotDrift(pressSnapshot) }
   const first = await waitFor(pending, budgetMs)
-  if (first !== 'timeout') return menuDecision(first, previous, { kind, pressProbe })
+  if (first !== 'timeout') {
+    // 双击最常见的失败形态不是"探针慢"，而是它**很快给了一个空答复**（ready 但
+    // selectionLength=0）：第二下松手时词选区还没生效。加大预算没用——探针早就回来了，
+    // 得等选区落定再读一次（同一坐标，只重试一次）。
+    let result = first
+    if (kind === 'double' && result !== null && (result.selection ?? '') === '' && point !== null) {
+      if (DOUBLE_RECHECK_MS > 0) await delay(DOUBLE_RECHECK_MS)
+      const rechecked = await waitFor(contextReader.probe(point, { retries: 1 }), 150)
+      if (rechecked !== 'timeout' && rechecked !== null) result = rechecked
+    }
+    return menuDecision(result, previous, { kind, pressProbe, lastShownAt })
+  }
   const grace = Math.min(1000, budgetMs * 3)
   const second = await waitFor(pending, grace)
   // 宽限期也用完：还是读不到 → open 为 null（交给剪贴板核实，见 confirmByClipboard）。
-  if (second === 'timeout') return menuDecision(null, previous, { kind, reason: 'timeout' })
-  return menuDecision(second, previous, { kind, pressProbe })
+  if (second === 'timeout') return menuDecision(null, previous, { kind, reason: 'timeout', lastShownAt })
+  return menuDecision(second, previous, { kind, pressProbe, lastShownAt })
 }
 
 /** 快照上量到的"读数到手时指针离按下点多远"（没量到给 null，policy 那边按可信处理）。 */
@@ -797,31 +1151,136 @@ function snapshotDrift(pressSnapshot) {
  * 核实成功时顺手把文字记进这次选区：点菜单项时就不用再复制一遍了。
  *
  * @param selection - 这次划词的锚点对象（核实成功会写入 `text` / `textSource`）。
- * @returns `{ state, reason, length }`；state 是 `text`（复制出文字了）/ `none`（没有文字，
- *   这次手势没在选文字）/ `skipped`（跑不起来：终端、用户正在 Ctrl+C、或显式关掉了核实）。
+ * @returns `{ state, reason, length, ...诊断 }`；state 是 `text`（复制出文字了）/
+ *   `none`（复制出来的是别的格式、确认没在选文字）/ `unknown`（两轮核实仍超时：拿不准，
+ *   调用方应退回 unknownFallback）/ `skipped`（跑不起来：终端、用户正在 Ctrl+C、或关掉了核实）。
  */
 async function confirmByClipboard(selection) {
   if (!CONFIRM_BY_CLIPBOARD) return { state: 'skipped', reason: 'disabled', length: 0 }
-  const captured = await captureSelection(api, {
-    checkOwner: OWNER_CHECK,
-    // 这次注入是我们自己发的：没复制出文字（典型：把形状/窗口复制走了）时把用户原来的
-    // 文字放回去，免得他们的剪贴板被我们弄丢（见 selection.mjs 的 restoreWhenEmpty）。
-    restoreWhenEmpty: true,
-    textOnly: true,
-    onReport: (report) => {
-      state.lastConfirm = report
-    },
-  })
-  const report = state.lastConfirm
-  const reason = typeof report?.reason === 'string' ? report.reason : 'timeout'
+  const attempt = () =>
+    captureSelection(api, {
+      checkOwner: OWNER_CHECK,
+      // 这次注入是我们自己发的：没复制出文字（典型：把形状/窗口复制走了）时把用户原来的
+      // 文字放回去，免得他们的剪贴板被我们弄丢（见 selection.mjs 的 restoreWhenEmpty）。
+      restoreWhenEmpty: true,
+      textOnly: true,
+      timeoutMs: CONFIRM_TIMEOUT_MS,
+      onReport: (report) => {
+        state.lastConfirm = report
+      },
+    })
+  // 双击的第二下松手时词选区未必已经生效：先静置一会儿再注入 Ctrl+C。
+  if (CONFIRM_SETTLE_MS > 0) await delay(CONFIRM_SETTLE_MS)
+  let captured = await attempt()
+  let report = state.lastConfirm
+  let reason = typeof report?.reason === 'string' ? report.reason : 'timeout'
+  // 首轮"超时且剪贴板一次都没被写过"再给一次机会：浏览器/PDF 里无障碍树慢一拍时，
+  // Ctrl+C 可能刚好赶在选区生效之前。首轮写过内容却没文字（复制了图片/形状）就不重试了
+  // ——再按一次 Ctrl+C 结局一样。
+  const wroteNothing = !(Number(report?.writes) > 0)
+  if (captured === null && reason === 'timeout' && wroteNothing && CONFIRM_RETRY_MS >= 0) {
+    if (CONFIRM_RETRY_MS > 0) await delay(CONFIRM_RETRY_MS)
+    captured = await attempt()
+    report = state.lastConfirm
+    reason = typeof report?.reason === 'string' ? report.reason : 'timeout'
+  }
+  const detail = {
+    writes: Number.isFinite(Number(report?.writes)) ? Number(report.writes) : null,
+    owner: typeof report?.owner === 'string' ? report.owner : null,
+    elapsedMs: Number.isFinite(Number(report?.elapsedMs)) ? Number(report.elapsedMs) : null,
+    injected: report?.injected === true,
+    userCopyObserved: report?.userCopyObserved === true,
+    foregroundClass: typeof report?.foregroundClass === 'string' ? report.foregroundClass : '',
+  }
   if (captured !== null && captured.trim() !== '') {
     const text = clampSelection(captured, MAX_TEXT)
     selection.text = text
     selection.textSource = 'clipboard-confirm'
-    return { state: 'text', reason: 'ok', length: text.length, formats: report?.formats ?? [] }
+    return { state: 'text', reason: 'ok', length: text.length, formats: report?.formats ?? [], ...detail }
   }
-  if (reason === 'terminal' || reason === 'user-copy') return { state: 'skipped', reason, length: 0 }
-  return { state: 'none', reason, length: 0, formats: report?.formats ?? [], editor: report?.editor ?? null }
+  if (reason === 'terminal' || reason === 'user-copy') return { state: 'skipped', reason, length: 0, ...detail }
+  // 重试后仍然超时：**不知道**有没有选中文字（不是"确认没有"）。以前把它折成 none，
+  // 于是拖选连 unknownFallback 的兜底都被吞掉——现在单独一档，交给调用方按 kind 兜底。
+  if (reason === 'timeout') return { state: 'unknown', reason, length: 0, formats: [], ...detail }
+  return { state: 'none', reason, length: 0, formats: report?.formats ?? [], editor: report?.editor ?? null, ...detail }
+}
+
+/**
+ * 剪贴板核实失败后再用 UIA 补读一次。
+ *
+ * Ctrl+C 注入经常会把无障碍树"焐热"：第一次探针读不到，按过一次 Ctrl+C 之后反而能读了。
+ * 读到非空就当作"迟到的证据"（reason = selection-late）；读不到返回 null，由调用方退回
+ * unknownFallback。
+ *
+ * @param selection - 这次划词的锚点对象（补读成功会写入 `text` / `textSource`）。
+ * @returns 读到的文字（非空）或 null。
+ */
+async function reprobeSelection(selection) {
+  if (contextReader === null) return null
+  try {
+    const result = await waitFor(
+      contextReader.probe({ x: selection.x, y: selection.y }, { retries: 1, press: selection.press }),
+      220,
+    )
+    if (result === 'timeout' || result === null || result === undefined) return null
+    applyProbe(selection, result, 'uia-late')
+    const text = typeof selection.text === 'string' ? selection.text.trim() : ''
+    return text === '' ? null : text
+  } catch (error) {
+    reportError('probe-late', error)
+    return null
+  }
+}
+
+/**
+ * 用剪贴板复核选中的文字（只在"拖选"手势上做）。
+ *
+ * UIA 的 TextPattern 在 Chrome/PDF 这类应用里经常只交出选区的一部分（实测：拖选一整段
+ * 公式文字，UIA 只给 39 个字），菜单和回答窗的「原文」就跟着短了。Ctrl+C 拿到的是应用
+ * 自己定义的完整选区，所以以它为准：复核成功且内容不同就换掉；超时/没选区就保留 UIA
+ * 结果（不阻塞、不丢词）。
+ *
+ * @param selection - 这次划词的锚点对象（`kind` 区分拖选/双击）。
+ * @param resolved - `resolveSelection` 的结果 `{ text, source }`（可为 null）。
+ * @returns `{ text, source }`；复核失败时原样返回 resolved。
+ */
+async function verifySelectionByClipboard(selection, resolved) {
+  if (resolved === null || resolved === undefined) return resolved
+  if (selection === null || selection === undefined) return resolved
+  // 双击选词走 UIA 就够准（词边界由应用自己给）；只对拖选做复核，避免每次双击都注入按键。
+  if (selection.kind !== 'drag') return resolved
+  // 用户显式要求"只用 UIA、绝不碰剪贴板"时不做复核。
+  if (TEXT_SOURCE === 'uia') return resolved
+  const text = typeof resolved.text === 'string' ? resolved.text : ''
+  if (text.trim() === '') return resolved
+  try {
+    const captured = await captureSelection(api, {
+      checkOwner: OWNER_CHECK,
+      restoreWhenEmpty: true,
+      textOnly: true,
+      timeoutMs: VERIFY_SELECTION_MS,
+      onReport: (report) => {
+        state.lastVerify = report
+      },
+    })
+    const copied = typeof captured === 'string' ? captured.trim() : ''
+    if (copied === '' || normalizeSelectionText(copied) === normalizeSelectionText(text)) return resolved
+    state.lastVerify = {
+      source: 'clipboard-verify',
+      uiaLength: text.length,
+      clipboardLength: copied.length,
+      at: Date.now(),
+    }
+    return { text: copied, source: 'clipboard-verify' }
+  } catch (error) {
+    reportError('verify-selection', error)
+    return resolved
+  }
+}
+
+/** 比较两段选区文字时忽略空白差异（换行/空格由应用自己决定）。 */
+function normalizeSelectionText(text) {
+  return String(text).replace(/\s+/g, ' ').trim()
 }
 
 /**
@@ -853,6 +1312,7 @@ function showMenu(selection) {
   menu.scale = scale
   menu.anchor = { x, y }
   menu.hover = -1
+  state.lastMenuShownAt = Date.now()
   menuWindow.setState({ dark: menu.dark, hover: -1 })
   menuWindow.show(px, py, width, height)
   if (menu.timer !== null) clearTimeout(menu.timer)
@@ -873,6 +1333,9 @@ function hideMenu(reason) {
     state.lastMenuDismiss = { reason, at: Date.now() }
     // 这个菜单绑的是哪段文字：菜单收起后，"手势没碰到 + 文字没变"的那次探针就是它。
     state.lastMenuSelection = typeof menu.selection?.text === 'string' ? menu.selection.text : ''
+    // "最近一次菜单开关"的时刻：policy 用它区分"菜单还开着/刚看过"与"过了好一会儿又划
+    // 同一段字"（STALE_REOPEN_MS 时间窗，见 policy.mjs 的 selection-reopen）。
+    state.lastMenuShownAt = Date.now()
     menu.visible = false
     if (menuReady()) menuWindow.hide()
   }
@@ -883,41 +1346,45 @@ function hideMenu(reason) {
 
 // ---------------------------------------------------------------- 跑一轮 agent
 
-/** 复制回答到剪贴板，并在页脚给一个看得见的回执。 */
-async function copyAnswer() {
-  if (ui.answer === '') {
-    setCopyFeedback('没有可复制的内容')
+/** 往"最近显示的那扇窗口"的页脚写一句回执（没有窗口就安静丢弃）。 */
+function flashFeedback(text) {
+  const record = activePanel()
+  if (record !== null) setCopyFeedback(record, text)
+}
+async function copyAnswer(record) {
+  if (record.ui.answer === '') {
+    setCopyFeedback(record, '没有可复制的内容')
     return
   }
   let copied = false
   try {
     const { writeClipboardText } = await import('./win32.mjs')
-    copied = writeClipboardText(api, ui.answer) !== false
+    copied = writeClipboardText(api, record.ui.answer) !== false
   } catch (error) {
     reportError('copy', error)
   }
-  setCopyFeedback(copied ? '已复制' : '复制失败')
+  setCopyFeedback(record, copied ? '已复制' : '复制失败')
 }
 
-/** 页脚回执（1.6s 后自动消失）。 */
-function setCopyFeedback(text) {
-  ui.copyFeedback = text
-  refreshMain()
-  if (copyFeedbackTimer !== null) clearTimeout(copyFeedbackTimer)
-  copyFeedbackTimer = setTimeout(() => {
-    copyFeedbackTimer = null
-    ui.copyFeedback = ''
-    refreshMain()
+/** 页脚回执（1.6s 后自动消失；每扇窗口各一个定时器）。 */
+function setCopyFeedback(record, text) {
+  if (record === null || record === undefined) return
+  record.ui.copyFeedback = text
+  refreshPanel(record)
+  if (record.copyFeedbackTimer !== null) clearTimeout(record.copyFeedbackTimer)
+  record.copyFeedbackTimer = setTimeout(() => {
+    record.copyFeedbackTimer = null
+    record.ui.copyFeedback = ''
+    refreshPanel(record)
   }, text === '已复制' ? 1600 : 2400)
-  copyFeedbackTimer.unref?.()
+  record.copyFeedbackTimer.unref?.()
 }
 
-async function stopRun() {
-  const sessionId = state.run?.sessionId
-  state.run?.abort?.()
-  state.run = null
-  ui.status = 'done'
-  refreshMain()
+async function stopRun(record) {
+  const sessionId = record.run?.sessionId
+  abortPanelRun(record)
+  record.ui.status = 'done'
+  refreshPanel(record)
   if (sessionId === undefined) return
   try {
     await fetch(DSH_ORIGIN + '/api/dsh-select-assist/stop', {
@@ -931,32 +1398,29 @@ async function stopRun() {
 }
 
 /**
- * 把回答窗口切到某一轮的初始状态并显示。
+ * 把一扇回答窗口切到某一轮的初始状态并显示。
  *
- * 只有点菜单项才会走到这里——新划词一律不动回答窗口里的内容
- * （踩过：弹菜单时顺手重置 ui.source/answer，于是"新划词后点一下窗口"就变成"显示新选中的
- * 文字 + 没有文本输出 + 就绪"）。
- *
- * @param action - 解释 / 翻译。
+ * @param record - 哪一扇窗口。
+ * @param action - 解释 / 总结 / 翻译。
  * @param selection - 这次要处理哪段选区（菜单上绑的那一次）。
  * @param status - `reading`（正在读选区）/ `running` / `error`。
  * @param error - status 为 error 时的错误文案。
  */
-function openPanel(action, selection, status, error = '') {
-  state.run?.abort?.()
-  state.run = null
-  ui.action = action
-  ui.source = selection === null || typeof selection.text !== 'string' ? '' : selection.text
-  ui.answer = ''
-  ui.error = error
-  ui.copyFeedback = ''
-  ui.context = selection === null || typeof selection.context !== 'string' ? '' : selection.context
-  ui.status = status
-  ui.scroll = 0
-  // 第一次打开时落在屏幕右下角；之后沿用用户拖到的位置
-  if (panel.mode === 'hidden') panel.position = null
-  applyMainMode('panel')
-  refreshMain()
+function openPanel(record, action, selection, status, error = '') {
+  abortPanelRun(record)
+  record.ui.action = action
+  record.window?.setTitle?.(panelTitle(action))
+  record.ui.source = selection === null || typeof selection.text !== 'string' ? '' : selection.text
+  record.ui.answer = ''
+  record.ui.error = error
+  record.ui.copyFeedback = ''
+  record.ui.context = selection === null || typeof selection.context !== 'string' ? '' : selection.context
+  record.ui.status = status
+  record.ui.scroll = 0
+  // 这扇窗口第一次显示时跟随选区放；之后沿用用户拖到的位置
+  if (record.panel.mode === 'hidden') record.panel.position = null
+  applyPanelMode(record, 'panel')
+  refreshPanel(record)
 }
 
 /**
@@ -1007,15 +1471,20 @@ async function resolveSelection(selection) {
 /**
  * 点菜单项之后：解析选区 → 跑一轮。
  *
- * @param action - 解释 / 翻译。
+ * 每一轮都落在**自己那扇窗口**上：同文同动作已有窗口就复用，否则新建一扇——
+ * 这样"先划一段翻译、再划另一段解释"两扇窗会同时留着。
+ *
+ * @param action - 解释 / 总结 / 翻译。
  * @param selection - 菜单上绑的那次选区。
  * @param isCurrent - 这次点击还是最新的吗（用户有没有紧接着又点了一次）。
  */
 async function beginFromMenu(action, selection, isCurrent) {
   if (selection === null || selection === undefined) return
   state.selection = selection
+  const record = panelForAction(action, selection)
+  if (record === null) return
   // 先给反馈：解析最长要走一次剪贴板兜底，不能让用户"点了没反应"。
-  openPanel(action, selection, 'reading')
+  openPanel(record, action, selection, 'reading')
   let resolved = null
   try {
     resolved = await resolveSelection(selection)
@@ -1023,19 +1492,22 @@ async function beginFromMenu(action, selection, isCurrent) {
     reportError('resolve', error)
     resolved = null
   }
+  // UIA 可能只给半截：拖选手势再让剪贴板核一遍（Ctrl+C 拿到的才是应用认的完整选区）。
+  if (resolved !== null) resolved = await verifySelectionByClipboard(selection, resolved)
   state.lastResolve = {
     ok: resolved !== null,
     source: resolved === null ? '' : resolved.source,
     length: resolved === null ? 0 : resolved.text.length,
     at: Date.now(),
   }
-  if (!isCurrent()) return
+  // 等待期间用户可能把这扇窗关了 / 又点了别的动作：这两种都不该再往里写。
+  if (!isCurrent() || !panelReady(record)) return
   if (resolved === null) {
-    openPanel(action, selection, 'error', '未能读取选中的文字，请重新划词后再试')
+    openPanel(record, action, selection, 'error', '未能读取选中的文字，请重新划词后再试')
     return
   }
   selection.text = resolved.text
-  startRun(action, selection)
+  startRun(record, action, selection)
 }
 
 /** 点菜单项之后的串行队列（latest-wins）：解析选区 + 开跑。 */
@@ -1101,31 +1573,78 @@ function probeForeground() {
 }
 
 /**
+ * 把选区包成 DSH 引用样式（每行以 "> " 开头），供粘贴进 Agent 输入框。
+ * 和 lib/client.js 的 quoteForInput 保持一致的观感，但上下文只在不太长时才带。
+ */
+function quoteSelectionForAgent(text, context) {
+  const quote = (value) => String(value).split(/\r?\n/).map((line) => (line.trim() === '' ? '>' : '> ' + line)).join('\n')
+  const parts = [quote(text)]
+  const contextText = typeof context === 'string' ? context.trim() : ''
+  if (contextText !== '' && contextText.length <= 2000) {
+    parts.push('', '> 上文（仅作语境，不必回答）：', quote(contextText))
+  }
+  return parts.join('\n')
+}
+
+/**
  * 「问问」：把选中的原文递给 DSH 页面（宿主信箱），再把 DSH 窗口拉回前台。
  *
  * 页面那半边会开一条新会话、把原文以引用形式填进输入框——**只填不发**，
  * 用户补完自己的问题再按回车。这里只负责"递过去 + 让人看见"。
+ *
+ * 如果选区本来就落在 Claude / Codex 桌面里，则不打扰 DSH：
+ * 直接把引用文本填进那个 Agent 自己的输入框（同样只填不发）。
  * @param selection - 菜单上绑的那次选区。
  */
 async function askSelection(selection) {
   const text = await waitForSelectionText(selection, 1500)
-  const trimmed = typeof text === 'string' ? text.trim() : ''
+  let trimmed = typeof text === 'string' ? text.trim() : ''
+  // 和回答窗同一套复核：UIA 只给半截时，递进 DSH 输入框的引用也不能缺。
+  if (trimmed !== '') {
+    const verified = await verifySelectionByClipboard(selection, { text: trimmed, source: 'uia' })
+    if (verified !== null) trimmed = String(verified.text).trim()
+  }
   if (trimmed === '') {
-    setCopyFeedback('未能读取选中文本')
+    flashFeedback('未能读取选中文本')
     return
+  }
+  // 选区来自 Claude/Codex 桌面 → 就地填进它自己的输入框，不切回 DSH。
+  const sourcePid = Number.isFinite(selection?.sourcePid) ? selection.sourcePid : 0
+  const agent = api === null || sourcePid <= 0 ? null : detectAgentHostForPid(api, sourcePid)
+  if (agent !== null) {
+    const draft = quoteSelectionForAgent(trimmed, selection?.context)
+    const injected = await fillAgentComposer(api, { hwnd: agent.hwnd, text: draft })
+    state.lastAsk = {
+      sourcePid,
+      mode: 'agent',
+      agent: { kind: agent.kind, label: agent.label, pid: agent.pid, title: agent.title },
+      injected: {
+        ok: injected.ok,
+        reason: injected.reason ?? null,
+        clicks: Array.isArray(injected.clicks) ? injected.clicks.length : 0,
+        composer: injected.composer ?? null,
+        verifyLength: typeof injected.after === 'string' ? injected.after.length : null,
+      },
+      at: Date.now(),
+    }
+    if (injected.ok) return
+    reportError('inject', new Error(injected.reason ?? 'unknown'))
+    // 注入失败就继续走 DSH 兜底——宁可多个 DSH 会话，也别把用户的话弄丢。
   }
   // 在 DSH 窗口里划的词 → 落当前会话；别的应用里划的词 → 新会话。
   const desktopPid = await resolveDshDesktopPid()
   const dshPids = [desktopPid, process.ppid, process.pid].filter((pid) => pid > 0)
   const mode = dshPids.includes(selection?.sourcePid) ? 'current' : 'new'
-  state.lastAsk = {
-    sourcePid: Number.isFinite(selection?.sourcePid) ? selection.sourcePid : null,
-    dshPids,
-    desktopPid,
-    mode,
-    /** 点菜单那一刻的前台（应当是菜单窗；真正判据见 sourcePid）。 */
-    fg: probeForeground(),
-    at: Date.now(),
+  if (agent === null) {
+    state.lastAsk = {
+      sourcePid: Number.isFinite(selection?.sourcePid) ? selection.sourcePid : null,
+      dshPids,
+      desktopPid,
+      mode,
+      /** 点菜单那一刻的前台（应当是菜单窗；真正判据见 sourcePid）。 */
+      fg: probeForeground(),
+      at: Date.now(),
+    }
   }
   try {
     const response = await fetch(DSH_ORIGIN + '/api/dsh-select-assist/handoff', {
@@ -1139,12 +1658,12 @@ async function askSelection(selection) {
     })
     if (!response.ok) {
       reportError('handoff', new Error('HTTP ' + response.status))
-      setCopyFeedback('递交失败')
+      flashFeedback('递交失败')
       return
     }
   } catch (error) {
     reportError('handoff', error)
-    setCopyFeedback('递交失败')
+    flashFeedback('递交失败')
     return
   }
   focusDshWindow()
@@ -1203,21 +1722,18 @@ function menuActionOf(row) {
   return 'explain'
 }
 
-/**
- * 发起一轮解释/总结/翻译，流式画到回答窗口。
- * @param action - 解释 / 总结 / 翻译。
- * @param selection - 这一次要处理哪段选区（含已解析好的 text 与 context）。
- */
-function startRun(action, selection = state.selection) {
+function startRun(record, action, selection = state.selection) {
+  if (record === null || record === undefined) return
   if (selection === null || typeof selection.text !== 'string' || selection.text.trim() === '') return
-  // 只有点菜单项才换内容：这里把"这次要处理什么"写进回答窗口
-  // （别处一律不动 ui.source —— 新划词只更新 state.selection，不会改窗口）
-  openPanel(action, selection, 'running')
+  // 只有点菜单项才换内容：这里把"这次要处理什么"写进这扇回答窗口
+  openPanel(record, action, selection, 'running')
 
   const controller = new AbortController()
-  state.run = { abort: () => controller.abort(), sessionId: undefined }
+  const runState = { abort: () => controller.abort(), sessionId: undefined }
+  record.run = runState
   const text = selection.text
   const context = typeof selection.context === 'string' ? selection.context : ''
+  const uiState = record.ui
   void (async () => {
     try {
       const response = await fetch(DSH_ORIGIN + '/api/dsh-select-assist/run', {
@@ -1249,38 +1765,39 @@ function startRun(action, selection = state.selection) {
             const event = JSON.parse(payload)
             if (event.type === 'delta') pending += event.text
             else if (event.type === 'session') {
-              if (state.run !== null) state.run.sessionId = event.sessionId
+              if (record.run !== null) record.run.sessionId = event.sessionId
             } else if (event.type === 'done') {
               pending = ''
-              ui.answer = event.text !== '' ? event.text : ui.answer
-              ui.status = 'done'
+              uiState.answer = event.text !== '' ? event.text : uiState.answer
+              uiState.status = 'done'
             } else if (event.type === 'error') {
-              ui.status = 'error'
-              ui.error = event.message
+              uiState.status = 'error'
+              uiState.error = event.message
             }
           }
           boundary = buffer.indexOf('\n\n')
         }
         const now = Date.now()
         if (pending !== '' && now - lastPaint > 80) {
-          ui.answer += pending
+          uiState.answer += pending
           pending = ''
           lastPaint = now
-          refreshMain()
+          refreshPanel(record)
         }
       }
       if (pending !== '') {
-        ui.answer += pending
-        refreshMain()
+        uiState.answer += pending
+        refreshPanel(record)
       }
     } catch (error) {
       if (controller.signal.aborted) return
-      ui.status = 'error'
-      ui.error = error instanceof Error ? error.message : String(error)
-      refreshMain()
+      uiState.status = 'error'
+      uiState.error = error instanceof Error ? error.message : String(error)
+      refreshPanel(record)
     } finally {
-      if (state.run !== null && state.run.sessionId === undefined) state.run = null
-      refreshMain()
+      // 这轮 stream 结束就清掉 run（换成下一轮时才保留新的）；否则 /status 会一直显示 running。
+      if (record.run === runState) record.run = null
+      refreshPanel(record)
     }
   })()
 }
@@ -1314,7 +1831,14 @@ function inRect(point, rect) {
  */
 async function handleGesture(gesture, isCurrent) {
   state.lastGesture = { ...gesture, at: Date.now() }
-  if (inRect(gesture, menu.rect) || inRect(gesture, panel.rect)) return
+  // 落在已有回答窗口的**有效区域**上不算划词（最小化时只剩标题条，下面透明区域不拦）。
+  const overMenu = inRect(gesture, menu.rect)
+  const overPanel = panels.some((record) => {
+    if (record.panel.mode === 'hidden' || record.ui.taskbarMinimized === true) return false
+    const rect = panelScreenRect(record)
+    return rect !== null && inRect(gesture, rect)
+  })
+  if (overMenu || overPanel) return
   const selection = {
     text: '',
     /** 这段文字是从哪一步读到的（uia-prefetch / uia-fresh / clipboard / preset）。 */
@@ -1346,19 +1870,42 @@ async function handleGesture(gesture, isCurrent) {
   let decision
   let confirm = null
   try {
-    decision = await decideMenu(pending, MENU_DECIDE_MS, state.lastMenuSelection, gesture.kind, gesture.press ?? null)
+    decision = await decideMenu(
+      pending,
+      MENU_DECIDE_MS,
+      state.lastMenuSelection,
+      gesture.kind,
+      gesture.press ?? null,
+      state.lastMenuShownAt,
+      { x: selection.x, y: selection.y },
+    )
     if (decision.open === null) {
       // UIA 说不出话（WPS/Office 的 Qt 版这类不暴露文档文本的应用）：用剪贴板核实一次
       // "到底有没有选中文字"——真选中了会复制出文字，拖动形状/窗口则什么都复制不出来。
       confirm = await confirmByClipboard(selection)
       if (confirm.state === 'text') decision = { open: true, reason: 'clipboard' }
       else if (confirm.state === 'none') decision = { open: false, reason: 'unconfirmed' }
-      else decision = unknownFallback(gesture.kind)
+      else {
+        // `unknown`（重试后仍超时）/`skipped`：拿不准有没有选中文字。补一次 UIA 读
+        // （Ctrl+C 往往把无障碍树焐热了），读到就弹；读不到才按 kind 退回老行为。
+        const late = await reprobeSelection(selection)
+        decision = late !== null ? { open: true, reason: 'selection-late' } : unknownFallback(gesture.kind)
+      }
     }
   } finally {
     deciding = false
   }
   state.lastMenuDecision = { open: decision.open, reason: decision.reason, kind: gesture.kind, at: Date.now() }
+  // 按"结论 + 手势种类 + reason"累计（/status 里能一眼看出偶发不弹是哪条判据在拦，
+  // 双击和拖选分开看——两者失败的根因不一样）。
+  const bucket = `${decision.open === true ? 'open' : decision.open === false ? 'closed' : 'deferred'}:${gesture.kind}:${decision.reason}`
+  state.reasonCounts[bucket] = (state.reasonCounts[bucket] ?? 0) + 1
+  // 剪贴板核实的失败原因单独计数（timeout = 根本没写进剪贴板，not-text-editing = 复制的是别的格式）。
+  const confirmReason = typeof confirm?.reason === 'string' ? confirm.reason : ''
+  if (confirmReason !== '') {
+    const key = `confirm:${confirmReason}`
+    state.reasonCounts[key] = (state.reasonCounts[key] ?? 0) + 1
+  }
   state.recentDecisions.push({
     at: state.lastMenuDecision.at,
     kind: gesture.kind,
@@ -1447,9 +1994,31 @@ function respondJson(res, status, payload) {
   res.end(JSON.stringify(payload))
 }
 
+/**
+ * 验收路由里挑一扇窗口：`id` / `index` 指定；都不给就取"最近显示的那扇"。
+ * 多窗并存之后 /click、/wheel、/capture 必须能指定目标，否则只能测到最上面一扇。
+ */
+function panelAt(body) {
+  if (body !== null && body !== undefined) {
+    const id = Number(body.id)
+    if (Number.isFinite(id)) {
+      const byId = panels.find((record) => record.id === id)
+      if (byId !== undefined) return byId
+    }
+    const index = Number(body.index)
+    if (Number.isInteger(index) && index >= 0 && index < panels.length) return panels[index]
+  }
+  return activePanel()
+}
+
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   if (req.method === 'GET' && url.pathname === '/status') {
+    const primary = activePanel()
+    const primaryUi = primary === null ? createPanelUi() : primary.ui
+    const primaryPanel = primary === null
+      ? { mode: 'hidden', rect: null, position: null, scale: 1 }
+      : primary.panel
     respondJson(res, 200, {
       ok: true,
       hookEnabled: HOOK_ENABLED,
@@ -1459,16 +2028,44 @@ const server = createServer((req, res) => {
       /** 选区文字的来源策略：auto / uia / clipboard。 */
       textSource: TEXT_SOURCE,
       menu: { visible: menu.visible, rect: menu.rect, scale: menu.scale, hover: menu.hover },
-      panel: { mode: panel.mode, rect: panel.rect, position: panel.position, scale: panel.scale },
+      panel: primaryPanel,
       ui: {
-        status: ui.status,
-        answerLength: ui.answer.length,
-        sourceLength: ui.source.length,
-            copyFeedback: ui.copyFeedback,
-        scroll: ui.scroll,
-        contentHeight: Math.round(ui.contentHeight),
-        viewHeight: Math.round(ui.viewHeight),
+        status: primaryUi.status,
+        action: primaryUi.action,
+        minimized: primaryUi.minimized === true,
+        taskbarMinimized: primaryUi.taskbarMinimized === true,
+        answerLength: primaryUi.answer.length,
+        sourceLength: primaryUi.source.length,
+        copyFeedback: primaryUi.copyFeedback,
+        scroll: primaryUi.scroll,
+        contentHeight: Math.round(primaryUi.contentHeight),
+        viewHeight: Math.round(primaryUi.viewHeight),
       },
+      /** 所有回答窗口（多窗并存；旧的 panel/ui 字段取"最近显示的那扇"）。 */
+      panels: panels.map((record) => ({
+        id: record.id,
+        mode: record.panel.mode,
+        minimized: record.ui.minimized === true,
+        taskbarMinimized: record.ui.taskbarMinimized === true,
+        running: record.run !== null,
+        rect: record.panel.rect,
+        position: record.panel.position,
+        scale: record.panel.scale,
+        size: record.panel.size,
+        action: record.ui.action,
+        status: record.ui.status,
+        sourceLength: record.ui.source.length,
+        answerLength: record.ui.answer.length,
+        scroll: record.ui.scroll,
+        contentHeight: Math.round(record.ui.contentHeight),
+        viewHeight: Math.round(record.ui.viewHeight),
+      })),
+      panelCount: panels.length,
+      maxPanels: MAX_PANELS,
+      /** 每个不弹/弹的 reason 各出现几次（偶发不弹时看这个）。 */
+      reasonCounts: state.reasonCounts,
+      /** 上一次菜单弹出的时刻（同一段文字过一会儿再划要能再弹）。 */
+      lastMenuShownAt: state.lastMenuShownAt,
       lastGesture: state.lastGesture,
       /** 最近一次 UIA 探针读到了什么（菜单呼不出来时先看这里）。 */
       lastProbe: state.lastProbe,
@@ -1476,6 +2073,8 @@ const server = createServer((req, res) => {
       pressProbe: state.lastPressProbe,
       /** 最近一次"用剪贴板核实有没有选中文字"的报告（UIA 判不了时才走这一步）。 */
       lastConfirm: state.lastConfirm,
+      /** 最近一次"用剪贴板复核选区原文"的结果（UIA 只给半截时会换掉它）。 */
+      lastVerify: state.lastVerify,
       /** 最近一次"弹不弹菜单"的结论与理由。 */
       lastMenuDecision: state.lastMenuDecision,
       /** 最近一次点菜单项之后，用的是哪个来源的文字。 */
@@ -1503,7 +2102,7 @@ const server = createServer((req, res) => {
         unit: state.selection === null ? '' : (state.selection.contextUnit ?? ''),
         /** 这次划词的选中文案长度（UIA 读到、或点菜单项后解析出来的）。 */
         selectionLength: state.selection === null ? 0 : String(state.selection.text ?? '').length,
-        length: ui.context.length,
+        length: primaryUi.context.length,
         stats: contextReader === null ? null : contextReader.stats(),
       },
       errors: state.errors.slice(-5),
@@ -1611,8 +2210,18 @@ const server = createServer((req, res) => {
         const op = String(body.op ?? '')
         if (op === 'mode') {
           const mode = ['panel', 'hidden'].includes(body.mode) ? body.mode : 'panel'
-          const geometry = mode === 'hidden' ? (hideMain(), null) : applyMainMode(mode)
-          respondJson(res, 200, { ok: true, geometry, mode: panel.mode })
+          if (mode === 'hidden') {
+            hideAllPanels()
+            respondJson(res, 200, { ok: true, geometry: null, mode: 'hidden', panelCount: panels.length })
+            return
+          }
+          const record = panelAt(body) ?? createPanel()
+          if (record === null) {
+            respondJson(res, 500, { ok: false, message: 'koffi / GDI+ 不可用' })
+            return
+          }
+          const geometry = applyPanelMode(record, 'panel')
+          respondJson(res, 200, { ok: true, geometry, mode: record.panel.mode, id: record.id, panelCount: panels.length })
           return
         }
         if (op === 'hide-menu') {
@@ -1665,10 +2274,13 @@ const server = createServer((req, res) => {
           respondJson(res, 200, { ok: true, target, row })
           return
         }
-        const scale = mainWindow.scale()
-        const handled = clickMain(cssX, cssY, ui)
-        void scale
-        respondJson(res, 200, { ok: true, target, handled })
+        const record = panelAt(body)
+        if (record === null) {
+          respondJson(res, 200, { ok: true, target, handled: false, panel: null })
+          return
+        }
+        const handled = clickPanel(record, cssX, cssY, record.ui)
+        respondJson(res, 200, { ok: true, target, handled, id: record.id })
       } catch (error) {
         respondJson(res, 500, { ok: false, message: String(error?.message ?? error) })
       }
@@ -1680,10 +2292,15 @@ const server = createServer((req, res) => {
       try {
         const body = await readJson(req)
         const delta = Number(body.delta ?? -120)
-        const maxScroll = Math.max(0, ui.contentHeight - ui.viewHeight)
-        ui.scroll = Math.min(maxScroll, Math.max(0, ui.scroll - Math.sign(delta) * 60))
-        refreshMain()
-        respondJson(res, 200, { ok: true, scroll: ui.scroll, maxScroll, rect: panel.rect })
+        const record = panelAt(body)
+        if (record === null) {
+          respondJson(res, 200, { ok: false, message: 'no panel' })
+          return
+        }
+        const maxScroll = Math.max(0, record.ui.contentHeight - record.ui.viewHeight)
+        record.ui.scroll = Math.min(maxScroll, Math.max(0, record.ui.scroll - Math.sign(delta) * 60))
+        refreshPanel(record)
+        respondJson(res, 200, { ok: true, id: record.id, scroll: record.ui.scroll, maxScroll, rect: record.panel.rect })
       } catch (error) {
         respondJson(res, 500, { ok: false, message: String(error?.message ?? error) })
       }
@@ -1697,10 +2314,20 @@ const server = createServer((req, res) => {
         const target = String(body.target ?? 'main')
         const cssX = Number(body.x ?? 0)
         const cssY = Number(body.y ?? 0)
-        const zone = target === 'menu' ? 'client' : hitZone(cssX * mainWindow.scale(), cssY * mainWindow.scale(), ui)
+        if (target === 'menu') {
+          respondJson(res, 200, { ok: true, target, zone: 'client', code: hitTestCode('client') })
+          return
+        }
+        const record = panelAt(body)
+        if (record === null) {
+          respondJson(res, 200, { ok: false, message: 'no panel' })
+          return
+        }
+        const scale = currentPanelSize(record).scale
+        const zone = hitZone(record, cssX * scale, cssY * scale)
         // code 是真正回给 Windows 的 WM_NCHITTEST 返回值（10=左 11=右 12=上 15=下，
         // 13/14/16/17 是四个对角）：验收时看这个，别只看语义名字。
-        respondJson(res, 200, { ok: true, target, zone, code: hitTestCode(zone) })
+        respondJson(res, 200, { ok: true, target, id: record.id, zone, code: hitTestCode(zone) })
       } catch (error) {
         respondJson(res, 500, { ok: false, message: String(error?.message ?? error) })
       }
@@ -1734,14 +2361,16 @@ const server = createServer((req, res) => {
       try {
         const body = await readJson(req)
         const file = String(body.file ?? join(tmpdir(), 'dsh-selection-overlay.bmp'))
-        const target = String(body.target ?? (panel.mode !== 'hidden' ? 'main' : 'menu'))
-        const rect = target === 'menu' ? menu.rect : panel.rect
+        const fallbackMain = activePanel() !== null && activePanel().panel.mode !== 'hidden'
+        const target = String(body.target ?? (fallbackMain ? 'main' : 'menu'))
+        const record = target === 'menu' ? null : panelAt(body)
+        const rect = target === 'menu' ? menu.rect : (record === null ? null : record.panel.rect)
         if (rect === null) {
           respondJson(res, 400, { ok: false, message: 'window hidden' })
           return
         }
         const shot = captureScreenRect(api, gdi, rect.x, rect.y, rect.width, rect.height, file)
-        respondJson(res, 200, { ok: true, ...shot })
+        respondJson(res, 200, { ok: true, id: record === null ? null : record.id, ...shot })
       } catch (error) {
         respondJson(res, 500, { ok: false, message: String(error?.message ?? error) })
       }
